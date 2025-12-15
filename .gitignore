@@ -1,0 +1,38 @@
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Node
+**/node_modules/
+**/.vite/
+**/dist/
+**/build/
+
+# Python
+**/__pycache__/
+**/*.pyc
+ml/.venv/
+ml/venv/
+
+# BIG ML STUFF (головне)
+ml/data/
+ml/train/
+ml/runs/
+ml/checkpoints/
+
+# Large model files (на всяк)
+ml/**/*.h5
+ml/**/*.keras
+ml/**/*.pkl
+ml/**/*.pt
+ml/**/*.onnx
