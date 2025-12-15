@@ -1,240 +1,118 @@
 import db from "../config/db.js";
-import { getHistorySchema } from "../utils/historySchema.js";
 
-let folderSchemaCache = null;
-
-function ident(name) {
-  const s = String(name);
-  return `"${s.replaceAll('"', '""')}"`;
-}
-
-async function getFolderSchema() {
-  if (folderSchemaCache) return folderSchemaCache;
-
-  const table = "folders";
-  const t = await db.query(
-    `SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1 LIMIT 1`,
-    [table]
-  );
-  if (!t.rowCount) throw new Error("Table missing: folders");
-
-  const c = await db.query(
-    `SELECT column_name
-     FROM information_schema.columns
-     WHERE table_schema='public' AND table_name=$1`,
-    [table]
-  );
-
-  const map = new Map();
-  for (const r of c.rows) map.set(String(r.column_name).toLowerCase(), r.column_name);
-
-  const pick = (arr) => {
-    for (const x of arr) {
-      const real = map.get(String(x).toLowerCase());
-      if (real) return real;
-    }
-    return null;
-  };
-
-  folderSchemaCache = {
-    table,
-    id: pick(["id"]),
-    userId: pick(["user_id", "userid"]),
-    name: pick(["name", "title"]),
-    createdAt: pick(["created_at", "createdat"]),
-  };
-
-  if (!folderSchemaCache.id || !folderSchemaCache.name) {
-    throw new Error("DB schema mismatch: folders.id/name not found");
-  }
-
-  return folderSchemaCache;
-}
-
+// GET /api/folders  (і /api/folders/all)
 export async function getFolders(req, res) {
   try {
-    const fs = await getFolderSchema();
-    const hs = await getHistorySchema();
-
     const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ message: "Неавторизовано" });
 
-    // folders list
-    const params = [];
-    let where = "";
-    if (userId && fs.userId) {
-      params.push(userId);
-      where = `WHERE ${ident(fs.userId)} = $1`;
-    }
-
-    const foldersRes = await db.query(
-      `SELECT ${ident(fs.id)} AS "id", ${ident(fs.name)} AS "name"
-       FROM public.${ident(fs.table)}
-       ${where}
-       ORDER BY ${ident(fs.name)} ASC`,
-      params
+    const r = await db.query(
+      `
+      SELECT id, name, created_at
+      FROM public.folders
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      `,
+      [userId]
     );
 
-    // counts from saved_results
-    const srParams = [];
-    let srWhere = "";
-    if (userId && hs.saved.userId) {
-      srParams.push(userId);
-      srWhere = `WHERE ${hs.ident(hs.saved.userId)} = $1`;
-    }
-
-    const totalRes = await db.query(
-      `SELECT COUNT(*)::int AS "c"
-       FROM public.${hs.ident(hs.tables.saved)}
-       ${srWhere}`,
-      srParams
-    );
-
-    const unassignedRes = await db.query(
-      `SELECT COUNT(*)::int AS "c"
-       FROM public.${hs.ident(hs.tables.saved)}
-       ${srWhere ? srWhere + " AND" : "WHERE"} (${hs.ident(hs.saved.folderId)} IS NULL OR ${hs.ident(hs.saved.folderId)}=0)`,
-      srParams
-    );
-
-    const perFolderRes = await db.query(
-      `SELECT ${hs.ident(hs.saved.folderId)} AS "folderId", COUNT(*)::int AS "c"
-       FROM public.${hs.ident(hs.tables.saved)}
-       ${srWhere}
-       GROUP BY ${hs.ident(hs.saved.folderId)}`,
-      srParams
-    );
-
-    const mapCounts = new Map();
-    for (const r of perFolderRes.rows) {
-      if (r.folderId !== null && r.folderId !== undefined) mapCounts.set(String(r.folderId), r.c);
-    }
-
-    const items = foldersRes.rows.map((f) => ({
-      id: f.id,
-      name: f.name,
-      itemsCount: mapCounts.get(String(f.id)) ?? 0,
-    }));
-
-    return res.json({
-      items,
-      totalCount: totalRes.rows[0]?.c ?? 0,
-      unassignedCount: unassignedRes.rows[0]?.c ?? 0,
-    });
+    return res.json({ items: r.rows || [] });
   } catch (e) {
     console.error("getFolders error:", e);
-    return res.status(500).json({ message: "Помилка папок" });
+    return res.status(500).json({ message: "Помилка завантаження папок" });
   }
 }
 
+// POST /api/folders { name }
 export async function createFolder(req, res) {
   try {
-    const fs = await getFolderSchema();
     const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ message: "Неавторизовано" });
 
     const name = String(req.body?.name || "").trim();
-    if (name.length < 2) return res.status(400).json({ message: "Надто коротка назва" });
+    if (!name) return res.status(400).json({ message: "Вкажи назву папки" });
+    if (name.length > 80) return res.status(400).json({ message: "Занадто довга назва" });
 
-    const cols = [ident(fs.name)];
-    const vals = ["$1"];
-    const params = [name];
+    const r = await db.query(
+      `
+      INSERT INTO public.folders (user_id, name)
+      VALUES ($1, $2)
+      RETURNING id, name, created_at
+      `,
+      [userId, name]
+    );
 
-    if (userId && fs.userId) {
-      cols.unshift(ident(fs.userId));
-      vals.unshift("$2");
-      params.push(userId);
-    }
-
-    const sql = `
-      INSERT INTO public.${ident(fs.table)} (${cols.join(", ")})
-      VALUES (${vals.join(", ")})
-      RETURNING ${ident(fs.id)} AS "id", ${ident(fs.name)} AS "name"
-    `;
-
-    const r = await db.query(sql, params);
-    return res.status(201).json({ item: r.rows[0] });
+    return res.json({ ok: true, folder: r.rows[0] });
   } catch (e) {
     console.error("createFolder error:", e);
-    return res.status(500).json({ message: "Не вдалося створити папку" });
+    return res.status(500).json({ message: "Помилка створення папки" });
   }
 }
 
+// PUT /api/folders/:id { name }
 export async function renameFolder(req, res) {
   try {
-    const fs = await getFolderSchema();
     const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ message: "Неавторизовано" });
 
     const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: "Bad folder id" });
+
     const name = String(req.body?.name || "").trim();
-
-    if (!Number.isFinite(id)) return res.status(400).json({ message: "Некоректний id" });
-    if (name.length < 2) return res.status(400).json({ message: "Некоректна назва" });
-
-    const params = [name, id];
-    let where = `WHERE ${ident(fs.id)} = $2`;
-
-    if (userId && fs.userId) {
-      params.push(userId);
-      where += ` AND ${ident(fs.userId)} = $3`;
-    }
+    if (!name) return res.status(400).json({ message: "Вкажи назву папки" });
 
     const r = await db.query(
-      `UPDATE public.${ident(fs.table)}
-       SET ${ident(fs.name)} = $1
-       ${where}
-       RETURNING ${ident(fs.id)} AS "id", ${ident(fs.name)} AS "name"`,
-      params
+      `
+      UPDATE public.folders
+      SET name = $1
+      WHERE id = $2 AND user_id = $3
+      RETURNING id, name, created_at
+      `,
+      [name, id, userId]
     );
 
-    if (!r.rowCount) return res.status(404).json({ message: "Папку не знайдено" });
-    return res.json({ item: r.rows[0] });
+    if (!r.rows?.length) return res.status(404).json({ message: "Папку не знайдено" });
+
+    return res.json({ ok: true, folder: r.rows[0] });
   } catch (e) {
     console.error("renameFolder error:", e);
-    return res.status(500).json({ message: "Не вдалося перейменувати" });
+    return res.status(500).json({ message: "Помилка перейменування" });
   }
 }
 
+// DELETE /api/folders/:id
 export async function deleteFolder(req, res) {
   try {
-    const fs = await getFolderSchema();
-    const hs = await getHistorySchema();
     const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ message: "Неавторизовано" });
 
     const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ message: "Некоректний id" });
+    if (!Number.isFinite(id)) return res.status(400).json({ message: "Bad folder id" });
 
-    // 1) відв’язуємо записи від папки
-    const params1 = [id];
-    let where1 = `WHERE ${hs.ident(hs.saved.folderId)} = $1`;
-    if (userId && hs.saved.userId) {
-      params1.push(userId);
-      where1 += ` AND ${hs.ident(hs.saved.userId)} = $2`;
-    }
-
+    // відв’язуємо saved_results від папки
     await db.query(
-      `UPDATE public.${hs.ident(hs.tables.saved)}
-       SET ${hs.ident(hs.saved.folderId)} = NULL
-       ${where1}`,
-      params1
+      `
+      UPDATE public.saved_results
+      SET folder_id = NULL
+      WHERE folder_id = $1 AND user_id = $2
+      `,
+      [id, userId]
     );
-
-    // 2) видаляємо папку
-    const params2 = [id];
-    let where2 = `WHERE ${ident(fs.id)} = $1`;
-    if (userId && fs.userId) {
-      params2.push(userId);
-      where2 += ` AND ${ident(fs.userId)} = $2`;
-    }
 
     const r = await db.query(
-      `DELETE FROM public.${ident(fs.table)}
-       ${where2}`,
-      params2
+      `
+      DELETE FROM public.folders
+      WHERE id = $1 AND user_id = $2
+      RETURNING id
+      `,
+      [id, userId]
     );
 
-    if (!r.rowCount) return res.status(404).json({ message: "Папку не знайдено" });
-    return res.json({ ok: true });
+    if (!r.rows?.length) return res.status(404).json({ message: "Папку не знайдено" });
+
+    return res.json({ ok: true, id });
   } catch (e) {
     console.error("deleteFolder error:", e);
-    return res.status(500).json({ message: "Не вдалося видалити папку" });
+    return res.status(500).json({ message: "Помилка видалення папки" });
   }
 }

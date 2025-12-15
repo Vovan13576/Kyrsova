@@ -1,96 +1,139 @@
+// server/src/utils/historySchema.js
 import db from "../config/db.js";
 
-let cached = null;
+let _schema = null;
 
 function ident(name) {
-  const s = String(name);
-  return `"${s.replaceAll('"', '""')}"`;
-}
-
-async function tableExists(tableName) {
-  const r = await db.query(
-    `SELECT 1
-     FROM information_schema.tables
-     WHERE table_schema='public' AND table_name=$1
-     LIMIT 1`,
-    [tableName]
-  );
-  return r.rowCount > 0;
-}
-
-async function getColumnsMap(tableName) {
-  const r = await db.query(
-    `SELECT column_name
-     FROM information_schema.columns
-     WHERE table_schema='public' AND table_name=$1`,
-    [tableName]
-  );
-
-  const map = new Map(); // lower -> real
-  for (const row of r.rows) {
-    map.set(String(row.column_name).toLowerCase(), row.column_name);
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+    throw new Error(`Invalid identifier: ${name}`);
   }
-  return map;
+  return `"${name}"`;
 }
 
-function pickCol(colsMap, candidates) {
+function firstExisting(colSet, candidates) {
   for (const c of candidates) {
-    const real = colsMap.get(String(c).toLowerCase());
-    if (real) return real;
+    if (colSet.has(c)) return c;
   }
   return null;
 }
 
+async function tableExists(tableName) {
+  const r = await db.query("SELECT to_regclass($1) AS reg", [`public.${tableName}`]);
+  return !!r.rows?.[0]?.reg;
+}
+
+async function getColumns(tableName) {
+  const r = await db.query(
+    `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema='public' AND table_name=$1
+  `,
+    [tableName]
+  );
+  return new Set((r.rows || []).map((x) => x.column_name));
+}
+
+/**
+ * ЦЕЙ schema використовується folderController-ом.
+ * У твоїй БД:
+ * saved_results має analysis_result_id (НЕ analysis_id)
+ * analysis_results має id, predicted_key, confidence, image_path, verified, folder_id, verified_at ...
+ */
 export async function getHistorySchema() {
-  if (cached) return cached;
+  if (_schema) return _schema;
 
-  const savedTable = "saved_results";
-  const analysisTable = "analysis_results";
-  const foldersTable = "folders";
-  const diseasesTable = "diseases";
+  // required tables
+  if (!(await tableExists("saved_results"))) {
+    throw new Error("DB schema mismatch: missing table public.saved_results");
+  }
+  if (!(await tableExists("analysis_results"))) {
+    throw new Error("DB schema mismatch: missing table public.analysis_results");
+  }
 
-  if (!(await tableExists(savedTable))) throw new Error(`Table missing: ${savedTable}`);
-  if (!(await tableExists(analysisTable))) throw new Error(`Table missing: ${analysisTable}`);
+  const savedCols = await getColumns("saved_results");
+  const analysisCols = await getColumns("analysis_results");
 
-  const srCols = await getColumnsMap(savedTable);
-  const arCols = await getColumnsMap(analysisTable);
+  // saved_results
+  const srId = firstExisting(savedCols, ["id", "saved_id", "savedid"]);
+  const srUserId = firstExisting(savedCols, ["user_id", "userid"]);
+  const srFolderId = firstExisting(savedCols, ["folder_id", "folderid"]);
+  const srSavedAt = firstExisting(savedCols, ["saved_at", "savedat", "created_at"]);
+  // ✅ головне виправлення — під твою БД
+  const srAnalysisFk = firstExisting(savedCols, [
+    "analysis_result_id", // ✅ у тебе так
+    "analysis_results_id",
+    "analysis_id",
+    "analysisid",
+  ]);
 
-  const schema = {
+  // analysis_results
+  const arId = firstExisting(analysisCols, ["id", "analysis_id", "analysisid"]);
+  const arUserId = firstExisting(analysisCols, ["user_id", "userid"]);
+  const arPredictedKey = firstExisting(analysisCols, ["predicted_key", "predictedkey"]);
+  const arConfidence = firstExisting(analysisCols, ["confidence", "probability", "score"]);
+  const arCreatedAt = firstExisting(analysisCols, ["created_at", "createdat"]);
+  const arImagePath = firstExisting(analysisCols, ["image_path", "image", "image_url", "path", "file_path"]);
+  const arVerified = firstExisting(analysisCols, ["verified", "is_verified", "isverified"]);
+  const arFolderId = firstExisting(analysisCols, ["folder_id", "folderid"]);
+  const arVerifiedAt = firstExisting(analysisCols, ["verified_at", "verifiedat"]);
+
+  // diseases (optional)
+  const hasDiseases = await tableExists("diseases");
+  let dCols = null;
+  let dKey = null,
+    dTitle = null,
+    dDesc = null,
+    dTips = null;
+
+  if (hasDiseases) {
+    dCols = await getColumns("diseases");
+    dKey = firstExisting(dCols, ["key", "disease_key"]);
+    dTitle = firstExisting(dCols, ["title", "name"]);
+    dDesc = firstExisting(dCols, ["description", "desc"]);
+    dTips = firstExisting(dCols, ["tips", "recommendations", "recs"]);
+  }
+
+  const missing = [];
+  if (!srId) missing.push("saved_results.id");
+  if (!srAnalysisFk) missing.push("saved_results.analysis_result_id");
+  if (!arId) missing.push("analysis_results.id");
+  if (!arPredictedKey) missing.push("analysis_results.predicted_key");
+  if (!arConfidence) missing.push("analysis_results.confidence");
+
+  if (missing.length) {
+    throw new Error(`DB schema mismatch: missing columns: ${missing.join(", ")}`);
+  }
+
+  _schema = {
     ident,
     tables: {
-      saved: savedTable,
-      analysis: analysisTable,
-      folders: (await tableExists(foldersTable)) ? foldersTable : null,
-      diseases: (await tableExists(diseasesTable)) ? diseasesTable : null,
+      saved: "saved_results",
+      analysis: "analysis_results",
+      diseases: hasDiseases ? "diseases" : null,
     },
     saved: {
-      id: pickCol(srCols, ["id", "saved_id", "savedid"]),
-      userId: pickCol(srCols, ["user_id", "userid"]),
-      folderId: pickCol(srCols, ["folder_id", "folderid", "folder"]),
-      analysisId: pickCol(srCols, ["analysis_id", "analysisid", "analysis"]),
-      savedAt: pickCol(srCols, ["saved_at", "savedat", "created_at", "createdat"]),
-      imageUrl: pickCol(srCols, ["image_url", "imageurl", "file_url", "fileurl", "path"]),
+      id: srId,
+      userId: srUserId,
+      folderId: srFolderId,
+      savedAt: srSavedAt,
+      analysisId: srAnalysisFk, // ✅ вказує на analysis_results.id через analysis_result_id
     },
     analysis: {
-      id: pickCol(arCols, ["id"]),
-      userId: pickCol(arCols, ["user_id", "userid"]),
-      predictedKey: pickCol(arCols, ["predicted_key", "predictedkey", "predicted"]),
-      confidence: pickCol(arCols, ["confidence", "probability", "score"]),
-      createdAt: pickCol(arCols, ["created_at", "createdat"]),
-      verified: pickCol(arCols, ["verified", "is_verified", "isverified"]),
-      imageUrl: pickCol(arCols, ["image_url", "imageurl", "file_url", "fileurl", "path"]),
-      diseaseTitle: pickCol(arCols, ["disease_title", "diseasetitle", "title"]),
-      diseaseDescription: pickCol(arCols, ["disease_description", "diseasedescription", "description"]),
-      diseaseTips: pickCol(arCols, ["disease_tips", "diseasetips", "tips"]),
+      id: arId,
+      userId: arUserId,
+      predictedKey: arPredictedKey,
+      confidence: arConfidence,
+      createdAt: arCreatedAt,
+      imagePath: arImagePath,
+      verified: arVerified,
+      folderId: arFolderId,
+      verifiedAt: arVerifiedAt,
     },
+    diseases: hasDiseases
+      ? { key: dKey, title: dTitle, description: dDesc, tips: dTips }
+      : null,
   };
 
-  // мінімально необхідні колонки
-  if (!schema.saved.id) throw new Error("DB schema mismatch: saved_results.id not found");
-  if (!schema.saved.folderId) throw new Error("DB schema mismatch: saved_results.folder_id not found");
-  if (!schema.saved.analysisId) throw new Error("DB schema mismatch: saved_results.analysis_id (or analysisId) not found");
-  if (!schema.analysis.id) throw new Error("DB schema mismatch: analysis_results.id not found");
-
-  cached = schema;
-  return schema;
+  return _schema;
 }
