@@ -1,35 +1,70 @@
-import axios from "axios";
-import { getToken } from "./auth";
+import { getToken } from "./auth.js";
 
-const API_BASE =
-  import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+const RAW_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
 
-export const api = axios.create({
-  baseURL: API_BASE,
-  withCredentials: false,
-});
-
-api.interceptors.request.use((config) => {
-  const token = getToken();
-  if (token) {
-    config.headers = config.headers || {};
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
-});
-
-export function getErrorMessage(err) {
-  // axios error
-  const data = err?.response?.data;
-  if (typeof data === "string") return data;
-  if (data?.error) return data.error;
-  if (data?.message) return data.message;
-
-  const status = err?.response?.status;
-  if (status) return `Помилка сервера (${status})`;
-
-  if (err?.message) return err.message;
-  return "Невідома помилка";
+function normalizeUrl(path) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${RAW_BASE}${p}`;
 }
 
+export function getErrorMessage(errOrResponse) {
+  if (!errOrResponse) return "Невідома помилка";
+  if (typeof errOrResponse === "string") return errOrResponse;
+
+  // якщо це fetch Response
+  if (errOrResponse instanceof Response) return `HTTP ${errOrResponse.status}`;
+
+  if (errOrResponse.message) return errOrResponse.message;
+  return "Помилка";
+}
+
+async function request(method, path, { data, isForm = false, headers = {} } = {}) {
+  const token = getToken();
+  const url = normalizeUrl(path);
+
+  const finalHeaders = { ...headers };
+  if (token) finalHeaders.Authorization = `Bearer ${token}`;
+
+  let body = undefined;
+
+  if (data !== undefined) {
+    if (isForm) {
+      body = data; // FormData
+    } else {
+      finalHeaders["Content-Type"] = "application/json";
+      body = JSON.stringify(data);
+    }
+  }
+
+  const res = await fetch(url, { method, headers: finalHeaders, body });
+
+  let payload = null;
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    payload = await res.json().catch(() => null);
+  } else {
+    payload = await res.text().catch(() => null);
+  }
+
+  if (!res.ok) {
+    const msg =
+      payload?.message || payload?.error || (typeof payload === "string" ? payload : null) || `HTTP ${res.status}`;
+    const e = new Error(msg);
+    e.status = res.status;
+    e.payload = payload;
+    throw e;
+  }
+
+  return payload;
+}
+
+const api = {
+  get: (path) => request("GET", path),
+  post: (path, data) => request("POST", path, { data }),
+  put: (path, data) => request("PUT", path, { data }),
+  del: (path) => request("DELETE", path),
+  postForm: (path, formData) => request("POST", path, { data: formData, isForm: true }),
+};
+
 export default api;
+export { api };
