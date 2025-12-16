@@ -1,66 +1,70 @@
-import { BrowserRouter, NavLink, Routes, Route, Navigate, useNavigate } from "react-router-dom";
-import Analyze from "./pages/Analyze.jsx";
-import History from "./pages/History.jsx";
-import Login from "./pages/Login.jsx";
-import Register from "./pages/Register.jsx";
+const API_BASE =
+  import.meta.env.VITE_API_BASE?.trim() || "http://localhost:5000/api";
 
-function TopBar() {
-  const navigate = useNavigate();
-  const token = localStorage.getItem("token");
+function getToken() {
+  return (
+    localStorage.getItem("token") ||
+    localStorage.getItem("accessToken") ||
+    localStorage.getItem("jwt") ||
+    ""
+  );
+}
 
-  const linkStyle = ({ isActive }) => ({
-    color: "white",
-    textDecoration: "none",
-    fontWeight: 800,
-    padding: "8px 12px",
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: isActive ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.18)"
+export function getErrorMessage(err, fallback = "Помилка") {
+  if (!err) return fallback;
+  if (typeof err === "string") return err;
+  if (err?.message) return err.message;
+  return fallback;
+}
+
+async function request(method, url, body, opts = {}) {
+  const token = getToken();
+  const headers = { ...(opts.headers || {}) };
+
+  // якщо body FormData — НЕ ставимо Content-Type
+  const isFormData = body instanceof FormData;
+
+  if (!isFormData && body !== undefined && body !== null) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const fullUrl = url.startsWith("http") ? url : `${API_BASE}${url.startsWith("/") ? "" : "/"}${url}`;
+
+  console.log("API >", method, fullUrl, isFormData ? "FormData" : body ?? "");
+
+  const res = await fetch(fullUrl, {
+    method,
+    headers,
+    body: body == null ? undefined : isFormData ? body : JSON.stringify(body),
   });
 
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 18 }}>
-      <div style={{ color: "white", fontWeight: 900, opacity: 0.95 }}>Plant Disease Detection</div>
+  const contentType = res.headers.get("content-type") || "";
+  const isJson = contentType.includes("application/json");
 
-      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-        <NavLink to="/" style={linkStyle}>Аналіз</NavLink>
-        <NavLink to="/history" style={linkStyle}>Історія</NavLink>
+  const data = isJson ? await res.json().catch(() => null) : await res.text().catch(() => null);
 
-        {!token ? (
-          <>
-            <button className="btn" onClick={() => navigate("/login")}>Увійти</button>
-            <button className="btn" onClick={() => navigate("/register")}>Реєстрація</button>
-          </>
-        ) : (
-          <button
-            className="btn"
-            onClick={() => {
-              localStorage.removeItem("token");
-              navigate("/login");
-            }}
-          >
-            Вийти
-          </button>
-        )}
-      </div>
-    </div>
-  );
+  if (!res.ok) {
+    const msg =
+      (data && typeof data === "object" && (data.message || data.error)) ||
+      (typeof data === "string" && data) ||
+      `HTTP ${res.status}`;
+    const e = new Error(msg);
+    e.status = res.status;
+    e.data = data;
+    throw e;
+  }
+
+  return data;
 }
 
-export default function App() {
-  return (
-    <BrowserRouter>
-      <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
-        <TopBar />
+export const apiGet = (url, opts) => request("GET", url, null, opts);
+export const apiPost = (url, body, opts) => request("POST", url, body, opts);
+export const apiPut = (url, body, opts) => request("PUT", url, body, opts);
+export const apiDelete = (url, opts) => request("DELETE", url, null, opts);
 
-        <Routes>
-          <Route path="/" element={<Analyze />} />
-          <Route path="/history" element={<History />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Register />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </div>
-    </BrowserRouter>
-  );
-}
+// для сумісності зі старими імпортами (якщо десь було)
+export const api = { apiGet, apiPost, apiPut, apiDelete, getErrorMessage };

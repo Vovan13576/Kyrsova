@@ -25,6 +25,7 @@ function getPool() {
   return _pool;
 }
 
+// ---- helpers ----
 function splitPredictedKey(predictedKey) {
   if (!predictedKey || typeof predictedKey !== "string") {
     return { plantName: "Unknown", diseaseName: "Unknown", isHealthy: false };
@@ -62,25 +63,41 @@ function runPythonPredict({ pythonPath, scriptPath, imagePath }) {
         const json = JSON.parse(text);
         resolve(json);
       } catch (e) {
-        reject(new Error(`ML output is not JSON.\nstdout:\n${text}\nstderr:\n${err}`));
+        reject(
+          new Error(
+            `ML output is not JSON.\nstdout:\n${text}\nstderr:\n${err}`
+          )
+        );
       }
     });
   });
 }
 
-async function getDiseaseInfoByKey(predictedKey) {
+async function findDiseaseByKey(predictedKey) {
   if (!predictedKey) return null;
-  try {
-    const pool = getPool();
-    const r = await pool.query(
-      `SELECT id, key, title, description, tips FROM public.diseases WHERE key = $1 LIMIT 1`,
-      [predictedKey]
-    );
-    return r.rows?.[0] || null;
-  } catch (e) {
-    console.error("DB read diseases error:", e);
-    return null;
-  }
+  const pool = getPool();
+
+  // спочатку точний збіг
+  const q1 = `
+    SELECT id, key, title, description, tips
+    FROM public.diseases
+    WHERE key = $1
+    LIMIT 1
+  `;
+  const r1 = await pool.query(q1, [predictedKey]);
+  if (r1.rows?.length) return r1.rows[0];
+
+  // на всяк випадок — нечутливо до регістру
+  const q2 = `
+    SELECT id, key, title, description, tips
+    FROM public.diseases
+    WHERE lower(key) = lower($1)
+    LIMIT 1
+  `;
+  const r2 = await pool.query(q2, [predictedKey]);
+  if (r2.rows?.length) return r2.rows[0];
+
+  return null;
 }
 
 // =========================
@@ -89,11 +106,14 @@ async function getDiseaseInfoByKey(predictedKey) {
 export async function analyzePlant(req, res) {
   try {
     if (!req.file?.path) {
-      return res.status(400).json({ ok: false, message: "No image uploaded (field name: image)" });
+      return res
+        .status(400)
+        .json({ ok: false, message: "No image uploaded (field name: image)" });
     }
 
     const pythonPath =
-      process.env.PYTHON_PATH || "C:/Kyrsova/plant-disease-web/ml/.venv/Scripts/python.exe";
+      process.env.PYTHON_PATH ||
+      "C:/Kyrsova/plant-disease-web/ml/.venv/Scripts/python.exe";
 
     const scriptPath =
       process.env.ML_PREDICT_PATH || "C:/Kyrsova/plant-disease-web/ml/predict.py";
@@ -101,37 +121,40 @@ export async function analyzePlant(req, res) {
     const imagePath = req.file.path;
 
     if (!fs.existsSync(pythonPath)) {
-      return res.status(500).json({ ok: false, message: "Python path not found", error: pythonPath });
+      return res.status(500).json({
+        ok: false,
+        message: "Python path not found",
+        error: pythonPath,
+      });
     }
     if (!fs.existsSync(scriptPath)) {
-      return res.status(500).json({ ok: false, message: "predict.py not found", error: scriptPath });
+      return res.status(500).json({
+        ok: false,
+        message: "predict.py not found",
+        error: scriptPath,
+      });
     }
 
     const ml = await runPythonPredict({ pythonPath, scriptPath, imagePath });
 
     const predictedKey = ml.predicted_key ?? ml.predictedKey ?? ml.key ?? null;
     const confidenceRaw = ml.confidence ?? ml.score ?? ml.prob ?? null;
-    const confidence = confidenceRaw === null || confidenceRaw === undefined ? null : Number(confidenceRaw);
-
-    const plant_detected =
-      ml["plant_detected"] ?? ml.plantDetected ?? ml.plant ?? true;
-
-    const plant_ratio =
-      ml["plant_ratio"] ?? ml.plant_ratio ?? null;
+    const confidence = confidenceRaw === null ? null : Number(confidenceRaw);
 
     const { plantName, diseaseName, isHealthy } = splitPredictedKey(predictedKey);
 
-    // якщо залогінений — req.user буде, бо optionalAuthMiddleware
+    // ✅ ВАЖЛИВО: підтягуємо опис і поради з БД
+    let disease = null;
+    try {
+      disease = await findDiseaseByKey(predictedKey);
+    } catch (e) {
+      console.warn("Disease lookup error:", e?.message || e);
+    }
+
+    // optionalAuthMiddleware може підставити req.user
     const userId = req.user?.id ?? null;
 
-    // зберігаємо фото як filename (не абсолютний шлях), щоб фронт робив URL нормально
-    const storedImagePath = req.file?.filename || null;
-    const imageUrl = storedImagePath ? `/uploads/${storedImagePath}` : null;
-
-    // підтягуємо опис/поради з таблиці diseases
-    const diseaseInfo = await getDiseaseInfoByKey(predictedKey);
-
-    // INSERT analysis_results (тільки якщо є userId або якщо хочеш зберігати і без логіну — залишай як є)
+    // ✅ Зберігаємо результат в analysis_results
     let analysisId = null;
     try {
       const pool = getPool();
@@ -142,12 +165,13 @@ export async function analyzePlant(req, res) {
           ($1, $2, $3, $4, false, NULL, NOW())
         RETURNING id
       `;
-      const r = await pool.query(q, [userId, predictedKey, confidence, storedImagePath]);
+      const r = await pool.query(q, [userId, predictedKey, confidence, imagePath]);
       analysisId = r.rows?.[0]?.id ?? null;
     } catch (dbErr) {
       console.error("DB insert analysis_results error:", dbErr);
     }
 
+    // ✅ Повертаємо description/tips так, як фронт очікує
     return res.json({
       ok: true,
       analysisId,
@@ -156,10 +180,13 @@ export async function analyzePlant(req, res) {
       plantName,
       diseaseName,
       isHealthy,
-      plant_detected,
-      plant_ratio,
-      disease: diseaseInfo,      // ✅ description + tips назад
-      imageUrl,                  // ✅ для прев’ю в історії
+
+      // ВАЖЛИВО ДЛЯ Analyze.jsx:
+      description: disease?.description ?? null,
+      tips: disease?.tips ?? null,
+      diseaseTitle: disease?.title ?? null,
+      diseaseId: disease?.id ?? null,
+
       raw: ml,
     });
   } catch (e) {
@@ -177,11 +204,10 @@ export async function analyzePlant(req, res) {
 // =========================
 export async function verifyAnalysis(req, res) {
   try {
-    const analysisId = Number(req.params?.id || 0);
-    const { verified } = req.body || {};
+    const { analysisId, verified } = req.body || {};
 
     if (!analysisId) {
-      return res.status(400).json({ ok: false, message: "Invalid analysis id" });
+      return res.status(400).json({ ok: false, message: "analysisId is required" });
     }
 
     const v = !!verified;
@@ -203,6 +229,10 @@ export async function verifyAnalysis(req, res) {
     return res.json({ ok: true, result: r.rows[0] });
   } catch (e) {
     console.error("verifyAnalysis error:", e);
-    return res.status(500).json({ ok: false, message: "Verify failed", error: String(e?.message || e) });
+    return res.status(500).json({
+      ok: false,
+      message: "Verify failed",
+      error: String(e?.message || e),
+    });
   }
 }

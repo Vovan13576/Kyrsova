@@ -1,42 +1,83 @@
 import React, { useEffect, useMemo, useState } from "react";
-import api, { getServerBaseUrl, getErrorMessage } from "../services/api";
-import { isAuthed } from "../services/auth";
 import { useNavigate } from "react-router-dom";
+import api, { getErrorMessage, getServerBaseUrl } from "../services/api.js";
+import { isAuthed } from "../services/auth.js";
 
 const cardStyle = {
-  background: "rgba(255,255,255,0.06)",
   border: "1px solid rgba(255,255,255,0.10)",
+  background: "rgba(255,255,255,0.06)",
   borderRadius: 18,
-  padding: 16,
+  padding: 14,
   boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
-  backdropFilter: "blur(10px)",
 };
 
-function toImageUrl(imagePathOrUrl) {
-  if (!imagePathOrUrl) return null;
-  if (imagePathOrUrl.startsWith("http")) return imagePathOrUrl;
+function splitPredictedKey(predictedKey) {
+  if (!predictedKey || typeof predictedKey !== "string") {
+    return { plantName: "Unknown", diseaseName: "Unknown" };
+  }
+  const parts = predictedKey.split("___");
+  const plantRaw = (parts[0] || "").trim();
+  const diseaseRaw = (parts.slice(1).join("___") || "").trim();
 
-  if (imagePathOrUrl.startsWith("/uploads/")) {
-    return `${getServerBaseUrl()}${imagePathOrUrl}`;
+  const plantName = (plantRaw || "Unknown").replaceAll("_", " ").trim();
+  const diseaseName = (diseaseRaw || "Unknown").replaceAll("_", " ").trim();
+  return { plantName, diseaseName };
+}
+
+function toImageUrl(imagePath) {
+  if (!imagePath) return "";
+
+  // already URL
+  if (typeof imagePath === "string" && (imagePath.startsWith("http://") || imagePath.startsWith("https://"))) {
+    return imagePath;
   }
 
-  const justName = imagePathOrUrl.replaceAll("\\", "/").split("/").pop();
-  return `${getServerBaseUrl()}/uploads/${justName}`;
+  const base = getServerBaseUrl();
+
+  // stored as "/uploads/xxx"
+  if (imagePath.startsWith("/uploads/")) return `${base}${imagePath}`;
+
+  // stored as "C:\...\uploads\xxx" -> take filename
+  const normalized = imagePath.replaceAll("\\", "/");
+  const idx = normalized.lastIndexOf("/uploads/");
+  if (idx !== -1) {
+    const tail = normalized.slice(idx);
+    return `${base}${tail}`;
+  }
+
+  // fallback: try attach
+  return `${base}${imagePath.startsWith("/") ? "" : "/"}${imagePath}`;
+}
+
+function formatPercent(conf) {
+  if (conf === null || conf === undefined || Number.isNaN(Number(conf))) return "—";
+  const p = Math.round(Number(conf) * 100);
+  return `${Math.max(0, Math.min(100, p))}%`;
 }
 
 function normalizeItem(x) {
-  // на випадок різних форматів
-  const predicted = x.predicted_key || x.predictedKey || x.key || "";
-  const conf = x.confidence ?? x.score ?? null;
+  const predicted_key = x.predicted_key ?? x.predictedKey ?? x.key ?? "";
+  const { plantName, diseaseName } = splitPredictedKey(predicted_key);
+
+  const confidence =
+    x.confidence === null || x.confidence === undefined
+      ? null
+      : Number(x.confidence);
+
   return {
     id: x.id,
-    predicted_key: predicted,
-    confidence: conf,
-    created_at: x.created_at || x.createdAt || null,
-    image_path: x.image_path || x.imagePath || x.imageUrl || null,
-    plantName: x.plantName || x.plant_name || "",
-    diseaseName: x.diseaseName || x.disease_name || "",
+    predicted_key,
+    plantName: x.plantName || plantName,
+    diseaseName: x.diseaseName || diseaseName,
+    confidence,
+    image_path: x.image_path || x.imagePath || "",
     verified: !!x.verified,
+    created_at: x.created_at || x.createdAt || null,
+
+    // optional disease info from backend
+    disease_title: x.disease_title || x.diseaseTitle || "",
+    disease_description: x.disease_description || x.diseaseDescription || "",
+    disease_tips: x.disease_tips || x.diseaseTips || "",
   };
 }
 
@@ -52,6 +93,8 @@ export default function History() {
 
   const [loading, setLoading] = useState(false);
   const [banner, setBanner] = useState("");
+
+  const [expandedId, setExpandedId] = useState(null);
 
   useEffect(() => {
     if (!isAuthed()) {
@@ -100,6 +143,7 @@ export default function History() {
 
   async function onSelectMode(mode) {
     setActiveFolder(mode);
+    setExpandedId(null);
     await loadItems(mode);
   }
 
@@ -153,6 +197,20 @@ export default function History() {
     }
   }
 
+  // ✅ НОВЕ: видалити аналіз
+  async function deleteAnalysis(item) {
+    if (!confirm(`Видалити аналіз ID: ${item.id}?`)) return;
+
+    try {
+      setBanner("");
+      await api.del(`/history/${item.id}`);
+      setExpandedId(null);
+      await loadItems(activeFolder);
+    } catch (e) {
+      setBanner(getErrorMessage(e));
+    }
+  }
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return items;
@@ -166,7 +224,15 @@ export default function History() {
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto", padding: "22px 16px" }}>
       {banner ? (
-        <div style={{ ...cardStyle, marginBottom: 14, padding: 12, borderColor: "rgba(255,120,120,0.22)", background: "rgba(255,120,120,0.10)" }}>
+        <div
+          style={{
+            ...cardStyle,
+            marginBottom: 14,
+            padding: 12,
+            borderColor: "rgba(255,120,120,0.22)",
+            background: "rgba(255,120,120,0.10)",
+          }}
+        >
           {banner}
         </div>
       ) : null}
@@ -176,95 +242,108 @@ export default function History() {
         <div style={{ ...cardStyle }}>
           <div style={{ fontSize: 18, fontWeight: 900, marginBottom: 10 }}>Папки</div>
 
+          {/* ✅ зроблено трохи більшим */}
           <button
             onClick={() => onSelectMode("all")}
             style={{
               width: "100%",
-              padding: "12px 12px",         // ✅ більша
+              padding: "14px 14px",
               borderRadius: 14,
               border: "1px solid rgba(255,255,255,0.12)",
               background: activeFolder === "all" ? "rgba(70,120,255,0.18)" : "rgba(255,255,255,0.06)",
               color: "#fff",
               cursor: "pointer",
-              fontWeight: 800,
+              fontWeight: 900,
               marginBottom: 10,
             }}
           >
             Усі / Без папки
           </button>
 
-          <div style={{ display: "grid", gap: 10, maxHeight: 420, overflow: "auto", paddingRight: 4 }}>
-            {folders.map((f) => (
-              <div
-                key={f.id}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr 44px 44px",
-                  gap: 10,
-                  alignItems: "center",
-                  padding: 10,
-                  borderRadius: 14,
-                  border: "1px solid rgba(255,255,255,0.10)",
-                  background: activeFolder === `folder:${f.id}` ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.05)",
-                }}
-              >
+          <button
+            onClick={() => onSelectMode("unassigned")}
+            style={{
+              width: "100%",
+              padding: "12px 12px",
+              borderRadius: 14,
+              border: "1px solid rgba(255,255,255,0.12)",
+              background: activeFolder === "unassigned" ? "rgba(70,120,255,0.18)" : "rgba(255,255,255,0.06)",
+              color: "#fff",
+              cursor: "pointer",
+              fontWeight: 800,
+              marginBottom: 12,
+            }}
+          >
+            Без папки (не розкладені)
+          </button>
+
+          <div style={{ borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: 12 }}>
+            {(folders || []).map((f) => (
+              <div key={f.id} style={{ display: "grid", gridTemplateColumns: "1fr 40px 40px", gap: 8, marginBottom: 10 }}>
                 <button
                   onClick={() => onSelectMode(`folder:${f.id}`)}
                   style={{
+                    width: "100%",
                     textAlign: "left",
-                    background: "transparent",
-                    border: "none",
+                    padding: "12px 12px",
+                    borderRadius: 14,
+                    border: "1px solid rgba(255,255,255,0.10)",
+                    background: activeFolder === `folder:${f.id}` ? "rgba(70,120,255,0.18)" : "rgba(255,255,255,0.05)",
                     color: "#fff",
                     cursor: "pointer",
                     fontWeight: 800,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
                   }}
+                  title={f.name}
                 >
                   {f.name}
                 </button>
 
                 <button
                   onClick={() => renameFolder(f)}
+                  title="Перейменувати"
                   style={{
-                    height: 40,
-                    borderRadius: 12,
+                    borderRadius: 14,
                     border: "1px solid rgba(255,255,255,0.12)",
                     background: "rgba(255,255,255,0.06)",
                     color: "#fff",
                     cursor: "pointer",
+                    fontWeight: 900,
                   }}
-                  title="Перейменувати"
                 >
-                  ✏️
+                  ✎
                 </button>
 
                 <button
                   onClick={() => deleteFolder(f)}
+                  title="Видалити папку"
                   style={{
-                    height: 40,
-                    borderRadius: 12,
-                    border: "1px solid rgba(255,90,90,0.30)",
-                    background: "rgba(255,90,90,0.10)",
+                    borderRadius: 14,
+                    border: "1px solid rgba(255,120,120,0.25)",
+                    background: "rgba(255,120,120,0.10)",
                     color: "#fff",
                     cursor: "pointer",
+                    fontWeight: 900,
                   }}
-                  title="Видалити"
                 >
-                  🗑️
+                  🗑
                 </button>
               </div>
             ))}
           </div>
 
-          <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "1fr 110px", gap: 10 }}>
+          <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 120px", gap: 10 }}>
             <input
               value={newFolderName}
               onChange={(e) => setNewFolderName(e.target.value)}
               placeholder="Нова папка..."
               style={{
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: "rgba(255,255,255,0.06)",
+                padding: "12px 12px",
+                borderRadius: 14,
+                border: "1px solid rgba(255,255,255,0.10)",
+                background: "rgba(0,0,0,0.20)",
                 color: "#fff",
                 outline: "none",
               }}
@@ -272,9 +351,10 @@ export default function History() {
             <button
               onClick={createFolder}
               style={{
-                borderRadius: 12,
+                padding: "12px 12px",
+                borderRadius: 14,
                 border: "1px solid rgba(255,255,255,0.12)",
-                background: "rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.07)",
                 color: "#fff",
                 cursor: "pointer",
                 fontWeight: 900,
@@ -285,119 +365,205 @@ export default function History() {
           </div>
         </div>
 
-        {/* right: list */}
+        {/* right: items */}
         <div style={{ ...cardStyle }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
             <div style={{ fontSize: 18, fontWeight: 900 }}>Мої перевірені</div>
 
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Пошук..."
-              style={{
-                marginLeft: "auto",
-                minWidth: 260,
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: "rgba(255,255,255,0.06)",
-                color: "#fff",
-                outline: "none",
-              }}
-            />
-
-            <button
-              onClick={() => loadItems(activeFolder)}
-              style={{
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: "rgba(255,255,255,0.08)",
-                color: "#fff",
-                cursor: "pointer",
-                fontWeight: 900,
-              }}
-            >
-              🔄 Оновити
-            </button>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Пошук..."
+                style={{
+                  width: 260,
+                  padding: "10px 12px",
+                  borderRadius: 14,
+                  border: "1px solid rgba(255,255,255,0.10)",
+                  background: "rgba(0,0,0,0.18)",
+                  color: "#fff",
+                  outline: "none",
+                }}
+              />
+              <button
+                onClick={() => loadItems(activeFolder)}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 14,
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  background: "rgba(255,255,255,0.07)",
+                  color: "#fff",
+                  cursor: "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                🔄 Оновити
+              </button>
+            </div>
           </div>
 
           {loading ? (
-            <div style={{ opacity: 0.8 }}>Завантаження...</div>
+            <div style={{ opacity: 0.85 }}>Завантаження...</div>
           ) : filtered.length === 0 ? (
-            <div style={{ opacity: 0.8 }}>Немає записів</div>
+            <div style={{ opacity: 0.8 }}>Поки що немає аналізів.</div>
           ) : (
             <div style={{ display: "grid", gap: 12 }}>
               {filtered.map((x) => {
                 const img = toImageUrl(x.image_path);
-                const conf =
-                  x.confidence === null || x.confidence === undefined
-                    ? null
-                    : Math.round(Number(x.confidence) * (Number(x.confidence) > 1 ? 1 : 100));
+                const percent = formatPercent(x.confidence);
+                const isExpanded = expandedId === x.id;
 
                 return (
                   <div
                     key={x.id}
                     style={{
-                      display: "grid",
-                      gridTemplateColumns: "110px 1fr 90px",
-                      gap: 12,
-                      alignItems: "center",
-                      padding: 12,
-                      borderRadius: 16,
+                      borderRadius: 18,
                       border: "1px solid rgba(255,255,255,0.10)",
                       background: "rgba(255,255,255,0.05)",
+                      padding: 12,
+                      display: "grid",
+                      gridTemplateColumns: "92px 1fr 90px",
+                      gap: 12,
+                      alignItems: "center",
                     }}
                   >
                     <div
                       style={{
-                        width: 110,
-                        height: 78,
+                        width: 92,
+                        height: 72,
                         borderRadius: 14,
                         overflow: "hidden",
-                        border: "1px solid rgba(255,255,255,0.10)",
+                        border: "1px solid rgba(255,255,255,0.12)",
                         background: "rgba(0,0,0,0.25)",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
                       }}
                     >
                       {img ? (
-                        <img src={img} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                      ) : (
-                        <div style={{ opacity: 0.7, fontSize: 12 }}>no image</div>
-                      )}
+                        <img
+                          src={img}
+                          alt="analysis"
+                          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                          onError={(e) => {
+                            e.currentTarget.style.display = "none";
+                          }}
+                        />
+                      ) : null}
                     </div>
 
-                    <div>
-                      <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 2 }}>
-                        {x.plantName || "Рослина"} <span style={{ opacity: 0.65 }}>—</span>{" "}
-                        {x.diseaseName || "Хвороба"}
+                    <div style={{ display: "grid", gap: 4 }}>
+                      <div style={{ fontSize: 16, fontWeight: 900 }}>
+                        Рослина — Хвороба
                       </div>
-                      <div style={{ opacity: 0.8, fontSize: 13 }}>
-                        {x.predicted_key || "—"}
+                      <div style={{ opacity: 0.9 }}>
+                        {x.plantName} — {x.diseaseName}
                       </div>
-                      <div style={{ opacity: 0.75, fontSize: 13, marginTop: 6 }}>
-                        ID: {x.id}
-                        {x.verified ? <span style={{ marginLeft: 10 }}>✅ verified</span> : null}
+
+                      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginTop: 4 }}>
+                        <div style={{ opacity: 0.75, fontSize: 13 }}>ID: {x.id}</div>
+
+                        {x.verified ? (
+                          <div
+                            style={{
+                              display: "inline-flex",
+                              gap: 6,
+                              alignItems: "center",
+                              padding: "3px 8px",
+                              borderRadius: 999,
+                              border: "1px solid rgba(120,255,180,0.22)",
+                              background: "rgba(120,255,180,0.10)",
+                              fontSize: 12,
+                              fontWeight: 800,
+                            }}
+                          >
+                            ✅ verified
+                          </div>
+                        ) : (
+                          <div
+                            style={{
+                              display: "inline-flex",
+                              gap: 6,
+                              alignItems: "center",
+                              padding: "3px 8px",
+                              borderRadius: 999,
+                              border: "1px solid rgba(255,255,255,0.12)",
+                              background: "rgba(255,255,255,0.06)",
+                              fontSize: 12,
+                              fontWeight: 800,
+                              opacity: 0.9,
+                            }}
+                          >
+                            ⏳ not verified
+                          </div>
+                        )}
+
+                        <button
+                          onClick={() => setExpandedId(isExpanded ? null : x.id)}
+                          style={{
+                            marginLeft: "auto",
+                            padding: "6px 10px",
+                            borderRadius: 12,
+                            border: "1px solid rgba(255,255,255,0.12)",
+                            background: "rgba(255,255,255,0.06)",
+                            color: "#fff",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          {isExpanded ? "▾ Сховати" : "▸ Деталі"}
+                        </button>
+
+                        <button
+                          onClick={() => deleteAnalysis(x)}
+                          title="Видалити аналіз"
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 12,
+                            border: "1px solid rgba(255,120,120,0.25)",
+                            background: "rgba(255,120,120,0.10)",
+                            color: "#fff",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          🗑 Видалити
+                        </button>
                       </div>
+
+                      {isExpanded ? (
+                        <div
+                          style={{
+                            marginTop: 10,
+                            padding: 10,
+                            borderRadius: 14,
+                            border: "1px solid rgba(255,255,255,0.10)",
+                            background: "rgba(0,0,0,0.18)",
+                          }}
+                        >
+                          <div style={{ fontWeight: 900, marginBottom: 6 }}>Опис</div>
+                          <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
+                            {x.disease_description || "Немає опису для цієї хвороби (в БД таблиці diseases)."}
+                          </div>
+
+                          <div style={{ fontWeight: 900, marginTop: 10, marginBottom: 6 }}>Рекомендації</div>
+                          <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
+                            {x.disease_tips || "Немає рекомендацій (в БД таблиці diseases)."}
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
 
-                    <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                    <div style={{ display: "grid", justifyItems: "end", gap: 8 }}>
                       <div
                         style={{
-                          width: 66,
-                          height: 66,
-                          borderRadius: 999,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
+                          width: 72,
+                          height: 72,
+                          borderRadius: "50%",
+                          border: "2px solid rgba(255,255,255,0.16)",
+                          display: "grid",
+                          placeItems: "center",
                           fontWeight: 900,
-                          border: "1px solid rgba(255,255,255,0.14)",
-                          background: "rgba(255,255,255,0.06)",
                         }}
                       >
-                        {conf !== null ? `${conf}%` : "—"}
+                        {percent}
                       </div>
                     </div>
                   </div>
