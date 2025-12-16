@@ -27,25 +27,21 @@ function splitPredictedKey(predictedKey) {
 function toImageUrl(imagePath) {
   if (!imagePath) return "";
 
-  // already URL
   if (typeof imagePath === "string" && (imagePath.startsWith("http://") || imagePath.startsWith("https://"))) {
     return imagePath;
   }
 
   const base = getServerBaseUrl();
 
-  // stored as "/uploads/xxx"
   if (imagePath.startsWith("/uploads/")) return `${base}${imagePath}`;
 
-  // stored as "C:\...\uploads\xxx" -> take filename
-  const normalized = imagePath.replaceAll("\\", "/");
+  const normalized = String(imagePath).replaceAll("\\", "/");
   const idx = normalized.lastIndexOf("/uploads/");
   if (idx !== -1) {
     const tail = normalized.slice(idx);
     return `${base}${tail}`;
   }
 
-  // fallback: try attach
   return `${base}${imagePath.startsWith("/") ? "" : "/"}${imagePath}`;
 }
 
@@ -60,9 +56,7 @@ function normalizeItem(x) {
   const { plantName, diseaseName } = splitPredictedKey(predicted_key);
 
   const confidence =
-    x.confidence === null || x.confidence === undefined
-      ? null
-      : Number(x.confidence);
+    x.confidence === null || x.confidence === undefined ? null : Number(x.confidence);
 
   return {
     id: x.id,
@@ -73,8 +67,8 @@ function normalizeItem(x) {
     image_path: x.image_path || x.imagePath || "",
     verified: !!x.verified,
     created_at: x.created_at || x.createdAt || null,
+    folder_id: x.folder_id ?? x.folderId ?? null,
 
-    // optional disease info from backend
     disease_title: x.disease_title || x.diseaseTitle || "",
     disease_description: x.disease_description || x.diseaseDescription || "",
     disease_tips: x.disease_tips || x.diseaseTips || "",
@@ -197,7 +191,6 @@ export default function History() {
     }
   }
 
-  // ✅ НОВЕ: видалити аналіз
   async function deleteAnalysis(item) {
     if (!confirm(`Видалити аналіз ID: ${item.id}?`)) return;
 
@@ -205,6 +198,21 @@ export default function History() {
       setBanner("");
       await api.del(`/history/${item.id}`);
       setExpandedId(null);
+      await loadItems(activeFolder);
+    } catch (e) {
+      setBanner(getErrorMessage(e));
+    }
+  }
+
+  // ✅ НОВЕ: перенести аналіз в іншу папку
+  async function moveAnalysisToFolder(item, folderId) {
+    try {
+      setBanner("");
+      const current = item.folder_id === null || item.folder_id === undefined ? "" : String(item.folder_id);
+      const next = folderId === null ? "" : String(folderId);
+      if (current === next) return;
+
+      await api.put(`/history/${item.id}/folder`, { folderId });
       await loadItems(activeFolder);
     } catch (e) {
       setBanner(getErrorMessage(e));
@@ -242,7 +250,6 @@ export default function History() {
         <div style={{ ...cardStyle }}>
           <div style={{ fontSize: 18, fontWeight: 900, marginBottom: 10 }}>Папки</div>
 
-          {/* ✅ зроблено трохи більшим */}
           <button
             onClick={() => onSelectMode("all")}
             style={{
@@ -413,6 +420,8 @@ export default function History() {
                 const percent = formatPercent(x.confidence);
                 const isExpanded = expandedId === x.id;
 
+                const folderValue = x.folder_id === null || x.folder_id === undefined ? "" : String(x.folder_id);
+
                 return (
                   <div
                     key={x.id}
@@ -450,9 +459,7 @@ export default function History() {
                     </div>
 
                     <div style={{ display: "grid", gap: 4 }}>
-                      <div style={{ fontSize: 16, fontWeight: 900 }}>
-                        Рослина — Хвороба
-                      </div>
+                      <div style={{ fontSize: 16, fontWeight: 900 }}>Рослина — Хвороба</div>
                       <div style={{ opacity: 0.9 }}>
                         {x.plantName} — {x.diseaseName}
                       </div>
@@ -474,7 +481,7 @@ export default function History() {
                               fontWeight: 800,
                             }}
                           >
-                            ✅ verified
+                            ✅ Перевірено
                           </div>
                         ) : (
                           <div
@@ -491,9 +498,38 @@ export default function History() {
                               opacity: 0.9,
                             }}
                           >
-                            ⏳ not verified
+                            ⏳ Не перевірено
                           </div>
                         )}
+
+                        {/* ✅ НОВЕ: перенос в папку */}
+                        <select
+                          value={folderValue}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            const next = v === "" ? null : Number(v);
+                            moveAnalysisToFolder(x, next);
+                          }}
+                          title="Перемістити в папку"
+                          style={{
+                            marginLeft: 8,
+                            padding: "6px 10px",
+                            borderRadius: 12,
+                            border: "1px solid rgba(255,255,255,0.12)",
+                            background: "rgba(255,255,255,0.06)",
+                            color: "#fff",
+                            outline: "none",
+                            cursor: "pointer",
+                            fontWeight: 800,
+                          }}
+                        >
+                          <option value="">Без папки</option>
+                          {(folders || []).map((f) => (
+                            <option key={f.id} value={String(f.id)}>
+                              {f.name}
+                            </option>
+                          ))}
+                        </select>
 
                         <button
                           onClick={() => setExpandedId(isExpanded ? null : x.id)}

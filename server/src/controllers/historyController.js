@@ -1,6 +1,6 @@
-import pgPkg from "pg";
 import fs from "fs";
 import path from "path";
+import pgPkg from "pg";
 
 const { Pool } = pgPkg;
 
@@ -23,128 +23,167 @@ function getPool() {
   return _pool;
 }
 
-function safeInt(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return null;
-  return Math.trunc(n);
-}
+// ---------- Helpers: safe columns detection ----------
+let _diseasesCols = null;
+let _analysisCols = null;
 
-async function fetchHistory(whereSql, params) {
-  const pool = getPool();
-
-  // ✅ якщо таблиці diseases нема — просто повернемо без join (щоб не падало)
-  const tryJoinDiseases = true;
-
-  if (tryJoinDiseases) {
-    try {
-      const q = `
-        SELECT
-          ar.id, ar.user_id, ar.predicted_key, ar.confidence, ar.image_path,
-          ar.verified, ar.folder_id, ar.created_at,
-          d.title       AS disease_title,
-          d.description AS disease_description,
-          d.tips        AS disease_tips
-        FROM public.analysis_results ar
-        LEFT JOIN public.diseases d
-          ON d.key = ar.predicted_key
-        ${whereSql}
-        ORDER BY ar.created_at DESC, ar.id DESC
-      `;
-      const r = await pool.query(q, params);
-      return r.rows || [];
-    } catch (e) {
-      // fallback без diseases
-      console.warn("History join diseases failed, fallback without diseases:", e?.message || e);
-    }
-  }
-
-  const q2 = `
-    SELECT
-      id, user_id, predicted_key, confidence, image_path,
-      verified, folder_id, created_at
-    FROM public.analysis_results
-    ${whereSql}
-    ORDER BY created_at DESC, id DESC
+async function getTableColumns(pool, tableName) {
+  const q = `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1
   `;
-  const r2 = await pool.query(q2, params);
-  return r2.rows || [];
+  const r = await pool.query(q, [tableName]);
+  return new Set((r.rows || []).map((x) => x.column_name));
 }
 
-export async function getHistoryAll(req, res) {
+async function getDiseasesCols(pool) {
+  if (_diseasesCols) return _diseasesCols;
   try {
-    const userId = req.user?.id;
-    const items = await fetchHistory(`WHERE ar.user_id = $1`, [userId]);
-    return res.json({ ok: true, items });
-  } catch (e) {
-    console.error("getHistoryAll error:", e);
-    return res.status(500).json({ ok: false, message: "History load failed", error: String(e?.message || e) });
+    _diseasesCols = await getTableColumns(pool, "diseases");
+  } catch {
+    _diseasesCols = new Set();
   }
+  return _diseasesCols;
+}
+
+async function getAnalysisCols(pool) {
+  if (_analysisCols) return _analysisCols;
+  try {
+    _analysisCols = await getTableColumns(pool, "analysis_results");
+  } catch {
+    _analysisCols = new Set();
+  }
+  return _analysisCols;
+}
+
+function pickFirstExisting(colsSet, candidates) {
+  for (const c of candidates) if (colsSet.has(c)) return c;
+  return null;
+}
+
+async function buildHistoryQuery(pool, whereSql) {
+  const diseasesCols = await getDiseasesCols(pool);
+
+  const keyCol = pickFirstExisting(diseasesCols, ["predicted_key", "key", "disease_key"]);
+  const titleCol = pickFirstExisting(diseasesCols, ["disease_title", "title", "name"]);
+  const descCol = pickFirstExisting(diseasesCols, ["disease_description", "description", "desc"]);
+  const tipsCol = pickFirstExisting(diseasesCols, ["disease_tips", "tips", "recommendations", "recommendation"]);
+
+  const baseSelect = `
+    SELECT
+      ar.id,
+      ar.user_id,
+      ar.predicted_key,
+      ar.confidence,
+      ar.image_path,
+      ar.verified,
+      ar.folder_id,
+      ar.created_at
+  `;
+
+  // якщо diseases таблиця/колонки є — робимо join, якщо ні — повертаємо NULL-и
+  if (keyCol) {
+    const sql = `
+      ${baseSelect},
+      ${titleCol ? `d.${titleCol}` : `NULL::text`} AS disease_title,
+      ${descCol ? `d.${descCol}` : `NULL::text`} AS disease_description,
+      ${tipsCol ? `d.${tipsCol}` : `NULL::text`} AS disease_tips
+      FROM public.analysis_results ar
+      LEFT JOIN public.diseases d
+        ON d.${keyCol} = ar.predicted_key
+      ${whereSql}
+      ORDER BY ar.created_at DESC NULLS LAST, ar.id DESC
+    `;
+    return sql;
+  }
+
+  const sql = `
+    ${baseSelect},
+      NULL::text AS disease_title,
+      NULL::text AS disease_description,
+      NULL::text AS disease_tips
+    FROM public.analysis_results ar
+    ${whereSql}
+    ORDER BY ar.created_at DESC NULLS LAST, ar.id DESC
+  `;
+  return sql;
+}
+
+async function fetchHistory(req, res, whereSql, params) {
+  try {
+    const pool = getPool();
+    const sql = await buildHistoryQuery(pool, whereSql);
+    const r = await pool.query(sql, params);
+    return res.json({ items: r.rows || [] });
+  } catch (e) {
+    console.error("history fetch error:", e);
+    return res
+      .status(500)
+      .json({ ok: false, message: "History fetch failed", error: String(e?.message || e) });
+  }
+}
+
+// ---------- GET ----------
+export async function getHistoryAll(req, res) {
+  const userId = req.user?.id;
+  return fetchHistory(req, res, `WHERE ar.user_id = $1`, [userId]);
 }
 
 export async function getHistoryUnassigned(req, res) {
-  try {
-    const userId = req.user?.id;
-    const items = await fetchHistory(`WHERE ar.user_id = $1 AND ar.folder_id IS NULL`, [userId]);
-    return res.json({ ok: true, items });
-  } catch (e) {
-    console.error("getHistoryUnassigned error:", e);
-    return res.status(500).json({ ok: false, message: "History load failed", error: String(e?.message || e) });
-  }
+  const userId = req.user?.id;
+  return fetchHistory(req, res, `WHERE ar.user_id = $1 AND ar.folder_id IS NULL`, [userId]);
 }
 
 export async function getHistoryByFolder(req, res) {
-  try {
-    const userId = req.user?.id;
-    const folderId = safeInt(req.params.id);
-    if (!folderId) return res.status(400).json({ ok: false, message: "Invalid folder id" });
+  const userId = req.user?.id;
+  const folderId = Number(req.params.id);
+  if (!folderId) return res.status(400).json({ ok: false, message: "Invalid folder id" });
 
-    const items = await fetchHistory(`WHERE ar.user_id = $1 AND ar.folder_id = $2`, [userId, folderId]);
-    return res.json({ ok: true, items });
-  } catch (e) {
-    console.error("getHistoryByFolder error:", e);
-    return res.status(500).json({ ok: false, message: "History load failed", error: String(e?.message || e) });
-  }
+  return fetchHistory(req, res, `WHERE ar.user_id = $1 AND ar.folder_id = $2`, [userId, folderId]);
 }
 
-// body: { analysisId, folderId }  folderId може бути null -> прибрати з папки
+// ---------- POST /history/save ----------
+// body: { analysisId, folderId? }
+// робить verified=true і (за потреби) прив’язує до папки
 export async function saveToHistory(req, res) {
   try {
     const userId = req.user?.id;
-    const analysisId = safeInt(req.body?.analysisId);
-    const folderIdRaw = req.body?.folderId;
-
-    if (!analysisId) return res.status(400).json({ ok: false, message: "analysisId is required" });
-
-    const folderId = folderIdRaw === null || folderIdRaw === undefined || folderIdRaw === "" ? null : safeInt(folderIdRaw);
-    if (folderIdRaw !== null && folderIdRaw !== undefined && folderIdRaw !== "" && !folderId) {
-      return res.status(400).json({ ok: false, message: "Invalid folderId" });
-    }
+    const { analysisId, folderId } = req.body || {};
+    const id = Number(analysisId);
+    if (!id) return res.status(400).json({ ok: false, message: "analysisId is required" });
 
     const pool = getPool();
 
-    // ✅ оновлюємо folder_id прямо в analysis_results
+    // folderId: null/"" => без папки
+    let fId = folderId === null || folderId === undefined || folderId === "" ? null : Number(folderId);
+    if (fId !== null && !Number.isFinite(fId)) fId = null;
+
+    // якщо folder задано — перевіримо що він належить юзеру
+    if (fId !== null) {
+      const fr = await pool.query(`SELECT id FROM public.folders WHERE id = $1 AND user_id = $2`, [fId, userId]);
+      if (!fr.rows?.length) return res.status(404).json({ ok: false, message: "Folder not found" });
+    }
+
+    const aCols = await getAnalysisCols(pool);
+    const hasVerifiedAt = aCols.has("verified_at");
+    const verifiedAtSql = hasVerifiedAt ? ", verified_at = NOW()" : "";
+
     const q = `
       UPDATE public.analysis_results
-      SET folder_id = $1
-      WHERE id = $2 AND user_id = $3
-      RETURNING id, folder_id
+      SET
+        user_id = $1,
+        folder_id = $2,
+        verified = true
+        ${verifiedAtSql}
+      WHERE id = $3
+        AND (user_id IS NULL OR user_id = $1)
+      RETURNING id, verified, folder_id
     `;
-    const r = await pool.query(q, [folderId, analysisId, userId]);
-    if (!r.rows?.length) return res.status(404).json({ ok: false, message: "Analysis not found" });
+    const r = await pool.query(q, [userId, fId, id]);
 
-    // (необов’язково) підтримка folder_items, якщо в тебе вже десь воно використовується
-    try {
-      await pool.query(`DELETE FROM public.folder_items WHERE analysis_id = $1`, [analysisId]);
-      if (folderId) {
-        await pool.query(
-          `INSERT INTO public.folder_items (folder_id, analysis_id, created_at)
-           VALUES ($1, $2, NOW())`,
-          [folderId, analysisId]
-        );
-      }
-    } catch (e) {
-      // якщо таблиці/колонки інші — просто не падаємо
-      console.warn("folder_items update skipped:", e?.message || e);
+    if (!r.rows?.length) {
+      return res.status(404).json({ ok: false, message: "Analysis not found or not allowed" });
     }
 
     return res.json({ ok: true, result: r.rows[0] });
@@ -154,62 +193,81 @@ export async function saveToHistory(req, res) {
   }
 }
 
-// ✅ НОВЕ: DELETE /api/history/:id
-export async function deleteHistoryItem(req, res) {
-  const pool = getPool();
-  const userId = req.user?.id;
-  const id = safeInt(req.params.id);
-
-  if (!id) return res.status(400).json({ ok: false, message: "Invalid id" });
-
+// ---------- PUT /history/:id/folder ----------
+// body: { folderId: number|null }
+export async function moveHistoryToFolder(req, res) {
   try {
-    await pool.query("BEGIN");
+    const userId = req.user?.id;
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, message: "Invalid analysis id" });
 
-    // беремо image_path щоб (опційно) видалити файл
-    const pre = await pool.query(
-      `SELECT id, image_path FROM public.analysis_results WHERE id = $1 AND user_id = $2`,
-      [id, userId]
-    );
-    if (!pre.rows?.length) {
-      await pool.query("ROLLBACK");
-      return res.status(404).json({ ok: false, message: "Analysis not found" });
+    const { folderId } = req.body || {};
+    const pool = getPool();
+
+    let fId = folderId === null || folderId === undefined || folderId === "" ? null : Number(folderId);
+    if (fId !== null && !Number.isFinite(fId)) fId = null;
+
+    if (fId !== null) {
+      const fr = await pool.query(`SELECT id FROM public.folders WHERE id = $1 AND user_id = $2`, [fId, userId]);
+      if (!fr.rows?.length) return res.status(404).json({ ok: false, message: "Folder not found" });
     }
-    const imagePath = pre.rows[0].image_path || "";
 
-    // чистимо зв’язки (якщо існують)
-    try {
-      await pool.query(`DELETE FROM public.folder_items WHERE analysis_id = $1`, [id]);
-    } catch {}
-
-    try {
-      await pool.query(`DELETE FROM public.saved_results WHERE analysis_result_id = $1`, [id]);
-    } catch {}
-
-    const del = await pool.query(
-      `DELETE FROM public.analysis_results WHERE id = $1 AND user_id = $2 RETURNING id`,
-      [id, userId]
+    const r = await pool.query(
+      `
+      UPDATE public.analysis_results
+      SET folder_id = $2
+      WHERE id = $1 AND user_id = $3
+      RETURNING id, folder_id
+      `,
+      [id, fId, userId]
     );
 
-    await pool.query("COMMIT");
+    if (!r.rows?.length) return res.status(404).json({ ok: false, message: "Analysis not found" });
 
-    // опційно: видаляємо файл з uploads
+    return res.json({ ok: true, result: r.rows[0] });
+  } catch (e) {
+    console.error("moveHistoryToFolder error:", e);
+    return res.status(500).json({ ok: false, message: "Move failed", error: String(e?.message || e) });
+  }
+}
+
+// ---------- DELETE /history/:id ----------
+export async function deleteHistoryItem(req, res) {
+  try {
+    const userId = req.user?.id;
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, message: "Invalid analysis id" });
+
+    const pool = getPool();
+
+    // знайдемо image_path щоб (опційно) стерти файл
+    const rr = await pool.query(
+      `SELECT image_path FROM public.analysis_results WHERE id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+    if (!rr.rows?.length) return res.status(404).json({ ok: false, message: "Analysis not found" });
+
+    const imagePath = rr.rows[0]?.image_path || "";
+
+    await pool.query(`DELETE FROM public.analysis_results WHERE id = $1 AND user_id = $2`, [id, userId]);
+
+    // best-effort: видалити файл, якщо це uploads
     try {
-      if (typeof imagePath === "string" && imagePath.includes("uploads")) {
-        const normalized = imagePath.replaceAll("\\", "/");
+      if (imagePath) {
+        const normalized = String(imagePath).replaceAll("\\", "/");
         const idx = normalized.lastIndexOf("/uploads/");
         if (idx !== -1) {
-          const filename = normalized.slice(idx + "/uploads/".length);
-          const abs = path.resolve(process.cwd(), "uploads", filename);
+          const rel = normalized.slice(idx + 1); // "uploads/xxx"
+          const abs = path.resolve(process.cwd(), rel);
           if (fs.existsSync(abs)) fs.unlinkSync(abs);
         }
       }
-    } catch {}
+    } catch (e2) {
+      console.warn("file delete skipped:", e2?.message || e2);
+    }
 
-    return res.json({ ok: true, deletedId: del.rows?.[0]?.id || id });
+    return res.json({ ok: true });
   } catch (e) {
-    try {
-      await pool.query("ROLLBACK");
-    } catch {}
     console.error("deleteHistoryItem error:", e);
     return res.status(500).json({ ok: false, message: "Delete failed", error: String(e?.message || e) });
   }
