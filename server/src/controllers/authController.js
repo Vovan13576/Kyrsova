@@ -1,21 +1,22 @@
+// server/src/controllers/authController.js
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import User from "../models/User.js";
 import db from "../config/db.js";
 
 function signToken(user) {
-  return jwt.sign(
-    { id: user.id, email: user.email },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-  );
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    throw new Error("JWT_SECRET is not set in .env");
+  }
+
+  return jwt.sign({ id: user.id, email: user.email }, secret, {
+    expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+  });
 }
 
-function authPayload(token, user) {
-  // ✅ сумісність з різними клієнтами:
-  // - token
-  // - accessToken
-  // - jwt
+function tokenResponse(token, user) {
+  // ✅ сумісність: фронт може чекати token/accessToken/jwt
   return {
     token,
     accessToken: token,
@@ -41,7 +42,7 @@ export async function register(req, res) {
     const user = await User.create(email, passwordHash);
     const token = signToken(user);
 
-    return res.status(201).json(authPayload(token, user));
+    return res.status(201).json(tokenResponse(token, user));
   } catch (e) {
     console.error("register error:", e);
     return res.status(500).json({ message: "Помилка реєстрації" });
@@ -65,13 +66,18 @@ export async function login(req, res) {
 
     // підтримка старих plaintext паролів
     let ok = false;
+    const passStr = String(password);
+
     if (stored.startsWith("$2")) {
-      ok = await bcrypt.compare(String(password), stored);
+      ok = await bcrypt.compare(passStr, stored);
     } else {
-      ok = String(password) === String(stored);
+      ok = passStr === stored;
       if (ok) {
-        const newHash = await bcrypt.hash(String(password), 10);
-        await db.query("UPDATE public.users SET password_hash=$1 WHERE id=$2", [newHash, userRow.id]);
+        const newHash = await bcrypt.hash(passStr, 10);
+        await db.query("UPDATE public.users SET password_hash=$1 WHERE id=$2", [
+          newHash,
+          userRow.id,
+        ]);
       }
     }
 
@@ -82,7 +88,7 @@ export async function login(req, res) {
     const user = { id: userRow.id, email: userRow.email };
     const token = signToken(user);
 
-    return res.json(authPayload(token, user));
+    return res.json(tokenResponse(token, user));
   } catch (e) {
     console.error("login error:", e);
     return res.status(500).json({ message: "Помилка входу" });

@@ -21,9 +21,16 @@ export default function Analyze() {
   const canSave = useMemo(() => Boolean(result?.analysisId), [result]);
 
   useEffect(() => {
+    // cleanup preview
     return () => {
       if (previewUrl) URL.revokeObjectURL(previewUrl);
-      stopCamera();
+    };
+  }, [previewUrl]);
+
+  // ✅ якщо сторінка закрилась/перемкнувся роут — камера точно вимкнеться
+  useEffect(() => {
+    return () => {
+      stopCamera(true);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -35,8 +42,7 @@ export default function Analyze() {
         return;
       }
       const r = await api.get("/folders");
-      const items = r?.items || r?.folders || r || [];
-      setFolders(Array.isArray(items) ? items : []);
+      setFolders(r.items || r.folders || []);
     } catch {
       setFolders([]);
     }
@@ -48,14 +54,13 @@ export default function Analyze() {
 
   async function startCamera() {
     setCameraError("");
-    try {
-      if (!navigator?.mediaDevices?.getUserMedia) {
-        setCameraError("Браузер не підтримує доступ до камери (mediaDevices.getUserMedia).");
-        return;
-      }
+    setBanner("");
 
-      // якщо вже є стрім — спочатку зупинимо
-      stopCamera();
+    try {
+      console.log("[CAMERA] start requested");
+
+      // якщо вже була камера — прибираємо попередній стрім
+      stopCamera(true);
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -64,47 +69,70 @@ export default function Analyze() {
 
       streamRef.current = stream;
 
-      // ✅ ВАЖЛИВО: videoRef має існувати. Тепер <video> рендериться завжди.
       const video = videoRef.current;
       if (video) {
         video.srcObject = stream;
 
+        // ✅ інколи потрібно дочекатись metadata
         await new Promise((resolve) => {
-          video.onloadedmetadata = () => resolve();
+          const done = () => resolve();
+          if (video.readyState >= 2) return done();
+          video.onloadedmetadata = done;
         });
 
         await video.play();
-        setCameraOn(true);
-      } else {
-        setCameraError("Video елемент не знайдено (videoRef null).");
-        setCameraOn(false);
       }
+
+      setCameraOn(true);
+      console.log("[CAMERA] started");
     } catch (e) {
-      console.error("startCamera error:", e);
+      console.error("[CAMERA] start error:", e);
       setCameraError(
-        `Не вдалося увімкнути камеру: ${e?.name || ""} ${e?.message || ""}. ` +
-          "Перевір дозвіл у браузері (камера) і чи вона не зайнята іншим додатком."
+        "Не вдалося увімкнути камеру. Перевір дозвіл у браузері (камера) і чи вона не зайнята іншим додатком."
       );
       setCameraOn(false);
     }
   }
 
-  function stopCamera() {
+  // ✅ force=true — для cleanup на unmount/перезапуск
+  function stopCamera(force = false) {
     try {
+      const video = videoRef.current;
+      if (video) {
+        try {
+          video.pause();
+        } catch {}
+        // ✅ ключове: прибрати srcObject, інакше може “висіти” чорний екран
+        video.srcObject = null;
+      }
+
       const s = streamRef.current;
-      if (s) s.getTracks().forEach((t) => t.stop());
-      if (videoRef.current) videoRef.current.srcObject = null;
+      if (s) {
+        s.getTracks().forEach((t) => {
+          try {
+            t.stop();
+          } catch {}
+        });
+      }
+
+      console.log("[CAMERA] stopped");
     } finally {
       streamRef.current = null;
-      setCameraOn(false);
+      if (!force) setCameraOn(false);
+      else setCameraOn(false);
     }
   }
 
   function onPickFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+
     setResult(null);
     setBanner("");
+
+    // якщо вибрали файл — камера точно вимикається
+    stopCamera(true);
+
     setFile(f);
     const url = URL.createObjectURL(f);
     setPreviewUrl(url);
@@ -113,22 +141,20 @@ export default function Analyze() {
   async function takePhoto() {
     setBanner("");
     const video = videoRef.current;
-    if (!video || !cameraOn) return;
-
-    const w = video.videoWidth || 1280;
-    const h = video.videoHeight || 720;
+    if (!video) return;
 
     const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
 
     const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, w, h);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
     if (!blob) return;
 
     const f = new File([blob], `camera_${Date.now()}.jpg`, { type: "image/jpeg" });
+
     setFile(f);
     setResult(null);
 
@@ -145,10 +171,12 @@ export default function Analyze() {
     setLoading(true);
     setResult(null);
     setBanner("");
+
     try {
       const fd = new FormData();
       fd.append("image", file);
 
+      // ✅ викликає /api/analyze (server.js тепер правильно підключив)
       const r = await api.postForm("/analyze", fd);
 
       if (r?.plant_detected === false) {
@@ -217,7 +245,7 @@ export default function Analyze() {
           <button onClick={startCamera}>Увімкнути камеру</button>
         ) : (
           <>
-            <button onClick={stopCamera}>Вимкнути камеру</button>
+            <button onClick={() => stopCamera(false)}>Вимкнути камеру</button>
             <button onClick={takePhoto}>Зробити фото (листок по центру)</button>
           </>
         )}
@@ -259,32 +287,23 @@ export default function Analyze() {
         <div style={{ padding: 14, borderRadius: 14, border: "1px solid rgba(255,255,255,0.12)" }}>
           <div style={{ marginBottom: 10, fontWeight: 700 }}>Попередній перегляд</div>
 
-          {/* ✅ video рендериться ЗАВЖДИ, щоб videoRef існував */}
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            style={{
-              width: "100%",
-              borderRadius: 12,
-              background: "#000",
-              minHeight: 280,
-              display: cameraOn ? "block" : "none",
-            }}
-          />
-
-          {!cameraOn ? (
-            previewUrl ? (
-              <img
-                src={previewUrl}
-                alt="preview"
-                style={{ width: "100%", borderRadius: 12, objectFit: "contain", background: "#000" }}
-              />
-            ) : (
-              <div style={{ opacity: 0.7 }}>Немає зображення</div>
-            )
-          ) : null}
+          {cameraOn ? (
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              style={{ width: "100%", borderRadius: 12, background: "#000", minHeight: 280 }}
+            />
+          ) : previewUrl ? (
+            <img
+              src={previewUrl}
+              alt="preview"
+              style={{ width: "100%", borderRadius: 12, objectFit: "contain", background: "#000" }}
+            />
+          ) : (
+            <div style={{ opacity: 0.7 }}>Немає зображення</div>
+          )}
         </div>
 
         <div style={{ padding: 14, borderRadius: 14, border: "1px solid rgba(255,255,255,0.12)" }}>

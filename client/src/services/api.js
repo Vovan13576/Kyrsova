@@ -1,75 +1,89 @@
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+// client/src/services/api.js
+import { getToken, clearAuth } from "./auth.js";
 
-function getStoredToken() {
-  return (
-    localStorage.getItem("token") ||
-    localStorage.getItem("accessToken") ||
-    localStorage.getItem("jwt") ||
-    ""
-  );
+const BASE_URL = import.meta?.env?.VITE_API_URL || "http://localhost:5000/api";
+
+function joinUrl(base, path) {
+  if (!path) return base;
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  if (path.startsWith("/")) return `${base}${path}`;
+  return `${base}/${path}`;
 }
 
-async function parseResponse(res) {
-  const ct = res.headers.get("content-type") || "";
-  if (ct.includes("application/json")) {
-    return await res.json().catch(() => null);
-  }
-  return await res.text().catch(() => "");
+export function getErrorMessage(err) {
+  if (!err) return "Unknown error";
+  if (typeof err === "string") return err;
+
+  // наш кинутий об’єкт
+  if (err.message) return err.message;
+
+  // fetch error
+  if (err.name === "TypeError") return "Network error (сервер недоступний?)";
+
+  return "Unknown error";
 }
 
-async function request(method, path, { body, isForm } = {}) {
-  const url = path.startsWith("http") ? path : `${API_BASE}${path}`;
+async function request(method, path, { json, formData } = {}) {
+  const url = joinUrl(BASE_URL, path);
 
+  const token = getToken();
   const headers = {};
-  const token = getStoredToken();
+
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  if (!isForm) headers["Content-Type"] = "application/json";
+  let body = undefined;
+  if (formData) {
+    body = formData; // НЕ ставимо Content-Type, браузер сам поставить boundary
+  } else if (json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(json);
+  }
 
-  // ✅ консоль-логи (як ти просив)
-  console.log(`API > ${method} ${url}`);
+  console.log("API >", method, url);
 
   const res = await fetch(url, {
     method,
     headers,
-    body: isForm ? body : body ? JSON.stringify(body) : undefined,
+    body,
+    credentials: "include",
   });
 
-  const data = await parseResponse(res);
+  let data = null;
+  const text = await res.text();
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text || null;
+  }
 
-  console.log(`API < ${res.status} ${method} ${path}`, data || "");
+  console.log("API <", res.status, method, path, data);
+
+  if (res.status === 401) {
+    // якщо токен протух/невалідний — очищаємо, щоб UI не “брехав”
+    clearAuth();
+  }
 
   if (!res.ok) {
     const msg =
-      (data && typeof data === "object" && (data.message || data.error)) ||
-      res.statusText ||
-      "Request failed";
-    const err = new Error(msg);
-    err.status = res.status;
-    err.data = data;
-    err.url = url;
-    throw err;
+      (data && (data.message || data.error || data.err)) ||
+      `HTTP ${res.status}`;
+
+    throw {
+      status: res.status,
+      message: msg,
+      data,
+    };
   }
 
   return data;
 }
 
-export function getErrorMessage(e) {
-  return (
-    e?.data?.message ||
-    e?.data?.error ||
-    e?.message ||
-    "Невідома помилка"
-  );
-}
-
 const api = {
   get: (path) => request("GET", path),
-  post: (path, body) => request("POST", path, { body }),
-  put: (path, body) => request("PUT", path, { body }),
+  post: (path, json) => request("POST", path, { json }),
+  put: (path, json) => request("PUT", path, { json }),
   del: (path) => request("DELETE", path),
-
-  postForm: (path, formData) => request("POST", path, { body: formData, isForm: true }),
+  postForm: (path, formData) => request("POST", path, { formData }),
 };
 
 export default api;
