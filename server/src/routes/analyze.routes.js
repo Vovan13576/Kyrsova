@@ -1,37 +1,28 @@
-import { Router } from "express";
+import express from "express";
 import multer from "multer";
-import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
-// ✅ ВАЖЛИВО: routes -> controllers це "../controllers", а не "./controllers"
+import authMiddleware from "../middleware/authMiddleware.js";
+import optionalAuthMiddleware from "../middleware/optionalAuthMiddleware.js";
 import { analyzePlant, verifyAnalysis } from "../controllers/analyzeController.js";
 
-const router = Router();
+const router = express.Router();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// uploads/analyze
-const uploadDir = path.join(__dirname, "..", "..", "uploads", "analyze");
-fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || "").toLowerCase() || ".jpg";
-    const safeExt = [".png", ".jpg", ".jpeg", ".webp"].includes(ext) ? ext : ".jpg";
-    const name = `leaf_${Date.now()}_${Math.round(Math.random() * 1e9)}${safeExt}`;
-    cb(null, name);
-  },
+// uploads into /server/uploads (same as server.js serves)
+const uploadsDir = path.resolve(__dirname, "../../uploads");
+const upload = multer({
+  dest: uploadsDir,
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-const upload = multer({ storage });
+// ВАЖЛИВО: optionalAuthMiddleware -> якщо залогінений, то req.user буде
+router.post("/analyze", optionalAuthMiddleware, upload.single("image"), analyzePlant);
 
-// POST /api/analyze  (multipart/form-data, поле "image")
-router.post("/", upload.single("image"), analyzePlant);
-
-// POST /api/analyze/verify  (JSON: { analysisId, verified })
-router.post("/verify", verifyAnalysis);
+// verify тільки для залогіненого
+router.post("/analyze/:id/verify", authMiddleware, verifyAnalysis);
 
 export default router;

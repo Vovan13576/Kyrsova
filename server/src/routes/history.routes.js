@@ -1,24 +1,17 @@
-import { Router } from "express";
+import express from "express";
 import authMiddleware from "../middleware/authMiddleware.js";
 import {
   getHistoryAll,
   getHistoryUnassigned,
   getHistoryByFolder,
-  saveHistoryItem,
-  deleteHistoryItem,
-  moveHistoryItem,
+  saveToHistory,
 } from "../controllers/historyController.js";
 
-const router = Router();
+const router = express.Router();
 
 router.get("/history", authMiddleware, getHistoryAll);
 router.get("/history/unassigned", authMiddleware, getHistoryUnassigned);
-router.get("/history/folder/:folderId", authMiddleware, getHistoryByFolder);
-
-router.post("/history", authMiddleware, saveHistoryItem);
-router.post("/history/save", authMiddleware, saveHistoryItem); // alias на всякий
-
-router.delete("/history/:savedId", authMiddleware, deleteHistoryItem);
-router.put("/history/:savedId/move", authMiddleware, moveHistoryItem);
+router.get("/history/folder/:id", authMiddleware, getHistoryByFolder);
+router.post("/history/save", authMiddleware, saveToHistory);
 
 export default router;
