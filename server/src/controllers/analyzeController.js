@@ -10,7 +10,6 @@ let _pool = null;
 function getPool() {
   if (_pool) return _pool;
 
-  // Підхоплюємо або DATABASE_URL, або окремі змінні
   const usingConnectionString = !!process.env.DATABASE_URL;
 
   _pool = usingConnectionString
@@ -18,7 +17,7 @@ function getPool() {
     : new Pool({
         host: process.env.DB_HOST || "localhost",
         port: Number(process.env.DB_PORT || 5432),
-        database: process.env.DB_NAME || "plantdb", // ⚠️ важливо: plantdb
+        database: process.env.DB_NAME || "plantdb",
         user: process.env.DB_USER || "postgres",
         password: process.env.DB_PASSWORD || "",
       });
@@ -26,7 +25,6 @@ function getPool() {
   return _pool;
 }
 
-// ---- helpers ----
 function splitPredictedKey(predictedKey) {
   if (!predictedKey || typeof predictedKey !== "string") {
     return { plantName: "Unknown", diseaseName: "Unknown", isHealthy: false };
@@ -59,7 +57,6 @@ function runPythonPredict({ pythonPath, scriptPath, imagePath }) {
         return reject(new Error(`ML process exit code=${code}\n${err || out}`));
       }
 
-      // очікуємо JSON в stdout
       const text = out.trim();
       try {
         const json = JSON.parse(text);
@@ -71,6 +68,21 @@ function runPythonPredict({ pythonPath, scriptPath, imagePath }) {
   });
 }
 
+async function getDiseaseInfoByKey(predictedKey) {
+  if (!predictedKey) return null;
+  try {
+    const pool = getPool();
+    const r = await pool.query(
+      `SELECT id, key, title, description, tips FROM public.diseases WHERE key = $1 LIMIT 1`,
+      [predictedKey]
+    );
+    return r.rows?.[0] || null;
+  } catch (e) {
+    console.error("DB read diseases error:", e);
+    return null;
+  }
+}
+
 // =========================
 // POST /api/analyze
 // =========================
@@ -80,44 +92,46 @@ export async function analyzePlant(req, res) {
       return res.status(400).json({ ok: false, message: "No image uploaded (field name: image)" });
     }
 
-    // Шлях до python з venv (можеш перевизначити через env PYTHON_PATH)
     const pythonPath =
       process.env.PYTHON_PATH || "C:/Kyrsova/plant-disease-web/ml/.venv/Scripts/python.exe";
 
-    // predict.py у папці ml
     const scriptPath =
       process.env.ML_PREDICT_PATH || "C:/Kyrsova/plant-disease-web/ml/predict.py";
 
     const imagePath = req.file.path;
 
     if (!fs.existsSync(pythonPath)) {
-      return res.status(500).json({
-        ok: false,
-        message: "Python path not found",
-        error: pythonPath,
-      });
+      return res.status(500).json({ ok: false, message: "Python path not found", error: pythonPath });
     }
     if (!fs.existsSync(scriptPath)) {
-      return res.status(500).json({
-        ok: false,
-        message: "predict.py not found",
-        error: scriptPath,
-      });
+      return res.status(500).json({ ok: false, message: "predict.py not found", error: scriptPath });
     }
 
     const ml = await runPythonPredict({ pythonPath, scriptPath, imagePath });
 
-    // очікуємо хоча б predicted_key + confidence
     const predictedKey = ml.predicted_key ?? ml.predictedKey ?? ml.key ?? null;
     const confidenceRaw = ml.confidence ?? ml.score ?? ml.prob ?? null;
-    const confidence = confidenceRaw === null ? null : Number(confidenceRaw);
+    const confidence = confidenceRaw === null || confidenceRaw === undefined ? null : Number(confidenceRaw);
+
+    const plant_detected =
+      ml["plant_detected"] ?? ml.plantDetected ?? ml.plant ?? true;
+
+    const plant_ratio =
+      ml["plant_ratio"] ?? ml.plant_ratio ?? null;
 
     const { plantName, diseaseName, isHealthy } = splitPredictedKey(predictedKey);
 
-    // (опціонально) юзер — якщо у тебе middleware підставляє req.user
+    // якщо залогінений — req.user буде, бо optionalAuthMiddleware
     const userId = req.user?.id ?? null;
 
-    // зберігаємо результат в analysis_results (під твою схему)
+    // зберігаємо фото як filename (не абсолютний шлях), щоб фронт робив URL нормально
+    const storedImagePath = req.file?.filename || null;
+    const imageUrl = storedImagePath ? `/uploads/${storedImagePath}` : null;
+
+    // підтягуємо опис/поради з таблиці diseases
+    const diseaseInfo = await getDiseaseInfoByKey(predictedKey);
+
+    // INSERT analysis_results (тільки якщо є userId або якщо хочеш зберігати і без логіну — залишай як є)
     let analysisId = null;
     try {
       const pool = getPool();
@@ -128,10 +142,9 @@ export async function analyzePlant(req, res) {
           ($1, $2, $3, $4, false, NULL, NOW())
         RETURNING id
       `;
-      const r = await pool.query(q, [userId, predictedKey, confidence, imagePath]);
+      const r = await pool.query(q, [userId, predictedKey, confidence, storedImagePath]);
       analysisId = r.rows?.[0]?.id ?? null;
     } catch (dbErr) {
-      // не валимо весь аналіз якщо БД тимчасово не вставилась
       console.error("DB insert analysis_results error:", dbErr);
     }
 
@@ -143,6 +156,10 @@ export async function analyzePlant(req, res) {
       plantName,
       diseaseName,
       isHealthy,
+      plant_detected,
+      plant_ratio,
+      disease: diseaseInfo,      // ✅ description + tips назад
+      imageUrl,                  // ✅ для прев’ю в історії
       raw: ml,
     });
   } catch (e) {
@@ -156,15 +173,15 @@ export async function analyzePlant(req, res) {
 }
 
 // =========================
-// POST /api/analyze/verify
-// body: { analysisId, verified }
+// POST /api/analyze/:id/verify
 // =========================
 export async function verifyAnalysis(req, res) {
   try {
-    const { analysisId, verified } = req.body || {};
+    const analysisId = Number(req.params?.id || 0);
+    const { verified } = req.body || {};
 
     if (!analysisId) {
-      return res.status(400).json({ ok: false, message: "analysisId is required" });
+      return res.status(400).json({ ok: false, message: "Invalid analysis id" });
     }
 
     const v = !!verified;

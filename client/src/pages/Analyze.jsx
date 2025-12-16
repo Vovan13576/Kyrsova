@@ -1,376 +1,467 @@
-// client/src/pages/Analyze.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { apiGet, apiPost, getErrorMessage } from "../services/api.js";
-import { isAuthed } from "../services/auth.js";
+import api, { getServerBaseUrl, getErrorMessage } from "../services/api";
+import { isAuthed } from "../services/auth";
+
+const cardStyle = {
+  background: "rgba(255,255,255,0.06)",
+  border: "1px solid rgba(255,255,255,0.10)",
+  borderRadius: 18,
+  padding: 18,
+  boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+  backdropFilter: "blur(10px)",
+};
+
+function toImageUrl(imagePathOrUrl) {
+  if (!imagePathOrUrl) return null;
+  if (imagePathOrUrl.startsWith("http")) return imagePathOrUrl;
+
+  // якщо вже /uploads/xxx
+  if (imagePathOrUrl.startsWith("/uploads/")) {
+    return `${getServerBaseUrl()}${imagePathOrUrl}`;
+  }
+
+  // якщо filename
+  const justName = imagePathOrUrl.replaceAll("\\", "/").split("/").pop();
+  return `${getServerBaseUrl()}/uploads/${justName}`;
+}
 
 export default function Analyze() {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const previewUrlRef = useRef(null);
-
-  const [cameraOn, setCameraOn] = useState(false);
-  const [file, setFile] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  const [msg, setMsg] = useState("");
-  const [result, setResult] = useState(null);
 
   const [folders, setFolders] = useState([]);
   const [folderId, setFolderId] = useState("");
 
-  const authed = useMemo(() => isAuthed(), []);
+  const [cameraOn, setCameraOn] = useState(false);
 
-  // ------- folders (for save) -------
-  useEffect(() => {
-    let ignore = false;
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState("");
 
-    async function load() {
-      if (!authed) return;
-      try {
-        const data = await apiGet("/folders");
-        const items = data?.items || data?.folders || data || [];
-        if (!ignore) setFolders(Array.isArray(items) ? items : []);
-      } catch {
-        // тихо, щоб не заважало аналізу
-      }
+  const [loading, setLoading] = useState(false);
+  const [banner, setBanner] = useState("");
+  const [result, setResult] = useState(null);
+
+  const canSave = useMemo(() => isAuthed() && !!result?.analysisId, [result]);
+
+  async function loadFolders() {
+    try {
+      if (!isAuthed()) return;
+      const data = await api.get("/folders");
+      const items = data?.items || data?.folders || data || [];
+      setFolders(Array.isArray(items) ? items : []);
+    } catch (e) {
+      // тихо
     }
+  }
 
-    load();
-    return () => {
-      ignore = true;
-    };
-  }, [authed]);
-
-  // ------- preview cleanup -------
   useEffect(() => {
-    return () => {
-      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
-    };
+    loadFolders();
   }, []);
 
-  // ------- attach stream to video -------
   useEffect(() => {
-    const video = videoRef.current;
-    const stream = streamRef.current;
+    return () => {
+      stopCamera();
+      if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    if (!cameraOn || !video || !stream) return;
-
+  async function startCamera() {
     try {
+      setBanner("");
+      // якщо вже увімкнено — перезапускаємо чисто
+      stopCamera();
+
+      setCameraOn(true);
+
+      const constraints = {
+        video: {
+          facingMode: "environment",
+        },
+        audio: false,
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      streamRef.current = stream;
+
+      const video = videoRef.current;
+      if (!video) return;
+
       video.srcObject = stream;
       video.muted = true;
       video.playsInline = true;
-      video.autoplay = true;
 
-      const onMeta = async () => {
+      // важливо: чекати metadata, потім play()
+      video.onloadedmetadata = async () => {
         try {
           await video.play();
         } catch {
-          // інколи браузер не дає play() одразу — але після жесту кнопкою буде ок
+          // інколи браузер блокує — але зазвичай після кліку дозволяє
         }
       };
-
-      video.addEventListener("loadedmetadata", onMeta);
-      return () => video.removeEventListener("loadedmetadata", onMeta);
-    } catch {
-      // ignore
-    }
-  }, [cameraOn]);
-
-  async function startCamera() {
-    setMsg("");
-    setResult(null);
-
-    // якщо був файл — прибираємо
-    setFile(null);
-    if (previewUrlRef.current) {
-      URL.revokeObjectURL(previewUrlRef.current);
-      previewUrlRef.current = null;
-    }
-    setPreviewUrl("");
-
-    // стоп старого стріму
-    stopCamera();
-
-    console.log("[CAMERA] start requested");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "environment",
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
-        audio: false,
-      });
-
-      streamRef.current = stream;
-      setCameraOn(true);
-
-      // інколи треба “підштовхнути” play() саме тут після жесту
-      const video = videoRef.current;
-      if (video) {
-        video.srcObject = stream;
-        try {
-          await video.play();
-        } catch {}
-      }
-
-      console.log("[CAMERA] started");
-    } catch (err) {
-      console.log("[CAMERA] error", err);
+    } catch (e) {
       setCameraOn(false);
-      streamRef.current = null;
-      setMsg("Не вдалося відкрити камеру (перевір дозволи браузера).");
+      setBanner("Не вдалося відкрити камеру. Дозволь доступ у браузері.");
     }
   }
 
   function stopCamera() {
-    const stream = streamRef.current;
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop());
-    }
-    streamRef.current = null;
-
-    const video = videoRef.current;
-    if (video) {
-      try {
-        video.pause();
-      } catch {}
-      video.srcObject = null;
-    }
-
-    if (cameraOn) console.log("[CAMERA] stopped");
+    try {
+      const video = videoRef.current;
+      if (video) {
+        video.pause?.();
+        video.srcObject = null;
+        video.onloadedmetadata = null;
+      }
+      const stream = streamRef.current;
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+    } catch {}
     setCameraOn(false);
   }
 
   function onPickFile(e) {
-    setMsg("");
-    setResult(null);
-
-    stopCamera();
-
+    setBanner("");
     const f = e.target.files?.[0];
     if (!f) return;
 
     setFile(f);
-    const url = URL.createObjectURL(f);
-    previewUrlRef.current = url;
-    setPreviewUrl(url);
-  }
-
-  async function takePhoto() {
-    setMsg("");
     setResult(null);
 
-    const video = videoRef.current;
-    if (!video || !streamRef.current) {
-      setMsg("Камера не запущена.");
-      return;
+    if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl(URL.createObjectURL(f));
+  }
+
+  function capturePhoto() {
+    try {
+      setBanner("");
+
+      const video = videoRef.current;
+      const stream = streamRef.current;
+      if (!video || !stream) {
+        setBanner("Камера не увімкнена.");
+        return;
+      }
+
+      const w = video.videoWidth || 1280;
+      const h = video.videoHeight || 720;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, w, h);
+
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        const captured = new File([blob], `camera_${Date.now()}.png`, { type: "image/png" });
+        setFile(captured);
+        setResult(null);
+
+        if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
+        setPreviewUrl(URL.createObjectURL(captured));
+      }, "image/png");
+    } catch {
+      setBanner("Не вдалося зробити фото з камери.");
     }
-
-    const w = video.videoWidth || 1280;
-    const h = video.videoHeight || 720;
-
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, w, h);
-
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
-    if (!blob) {
-      setMsg("Не вдалося зробити фото.");
-      return;
-    }
-
-    const shot = new File([blob], `camera_${Date.now()}.jpg`, { type: "image/jpeg" });
-    setFile(shot);
-
-    const url = URL.createObjectURL(shot);
-    previewUrlRef.current = url;
-    setPreviewUrl(url);
-
-    // можна залишити камеру увімкненою, але UI тоді часто плутає людей.
-    // Вимикаємо — щоб було стабільно.
-    stopCamera();
   }
 
   async function runAnalyze() {
-    setMsg("");
-    setResult(null);
-
     if (!file) {
-      setMsg("Спочатку вибери файл або зроби фото.");
+      setBanner("Спочатку вибери файл або зроби фото з камери.");
       return;
     }
 
-    setBusy(true);
     try {
+      setBanner("");
+      setLoading(true);
+      setResult(null);
+
       const fd = new FormData();
       fd.append("image", file);
 
-      const data = await apiPost("/analyze", fd);
+      const data = await api.postForm("/analyze", fd);
 
-      // очікуємо щось типу:
-      // { ok:true, analysisId, plantName, diseaseName, predictedKey, confidence, isHealthy, ... }
-      setResult(data);
-
-      if (data?.ok === false) {
-        setMsg(data?.message || "Аналіз не вдався.");
-      } else {
-        setMsg("");
+      if (!data?.ok) {
+        setBanner(data?.message || "Аналіз не вдався.");
+        return;
       }
-    } catch (err) {
-      setMsg(getErrorMessage(err));
+
+      setResult(data);
+    } catch (e) {
+      setBanner(getErrorMessage(e));
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
   }
 
   async function saveToFolder() {
-    setMsg("");
-
-    if (!authed) {
-      setMsg("Щоб зберігати — увійди.");
-      return;
-    }
-    if (!result?.analysisId) {
-      setMsg("Немає analysisId від сервера. Після аналізу сервер має повернути analysisId.");
-      return;
-    }
-
-    setBusy(true);
     try {
+      if (!canSave) return;
+
+      setBanner("");
       const payload = {
         analysisId: result.analysisId,
         folderId: folderId ? Number(folderId) : null,
       };
 
-      await apiPost("/history/save", payload);
-      setMsg("✅ Збережено в «Мої перевірені».");
-    } catch (err) {
-      setMsg(getErrorMessage(err));
-    } finally {
-      setBusy(false);
+      const data = await api.post("/history/save", payload);
+      if (data?.ok === false) {
+        setBanner(data?.message || "Не вдалося зберегти.");
+        return;
+      }
+
+      setBanner("✅ Збережено в «Мої перевірені»");
+    } catch (e) {
+      setBanner(getErrorMessage(e));
     }
   }
 
   function clearAll() {
-    setMsg("");
+    setBanner("");
     setResult(null);
-
-    stopCamera();
-
     setFile(null);
-    if (previewUrlRef.current) {
-      URL.revokeObjectURL(previewUrlRef.current);
-      previewUrlRef.current = null;
-    }
+    if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
     setPreviewUrl("");
   }
 
+  const diseaseTitle = result?.disease?.title || (result?.diseaseName ?? "");
+  const diseaseDesc = result?.disease?.description || "";
+  const diseaseTips = result?.disease?.tips || "";
+
+  const confidencePct =
+    result?.confidence === null || result?.confidence === undefined
+      ? null
+      : Math.round(Number(result.confidence) * (Number(result.confidence) > 1 ? 1 : 100));
+
   return (
-    <div className="page">
-      <div className="card hero">
-        <div className="heroTop">
-          <div>
-            <h1 className="heroTitle">Plant Disease Detection</h1>
-            <div className="heroSub">
-              Завантаж фото або увімкни камеру, зроби кадр і запускай аналіз.
-            </div>
-          </div>
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "22px 16px" }}>
+      {/* верхній блок керування */}
+      <div style={{ ...cardStyle, marginBottom: 16 }}>
+        <div style={{ fontSize: 26, fontWeight: 800, marginBottom: 6 }}>Plant Disease Detection</div>
+        <div style={{ opacity: 0.85, marginBottom: 14 }}>
+          Завантаж фото або увімкни камеру, зроби кадр і запускай аналіз.
+        </div>
 
-          <div className="heroActions">
-            <label className="btn soft">
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input type="file" accept="image/*" onChange={onPickFile} style={{ display: "none" }} />
+            <span style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)" }}>
               📁 Вибрати файл
-              <input type="file" accept="image/*" onChange={onPickFile} style={{ display: "none" }} />
-            </label>
+            </span>
+          </label>
 
-            {!cameraOn ? (
-              <button className="btn soft" onClick={startCamera}>
-                📷 Увімкнути камеру
+          {!cameraOn ? (
+            <button
+              onClick={startCamera}
+              style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(70,120,255,0.20)", border: "1px solid rgba(70,120,255,0.35)", color: "#fff", cursor: "pointer" }}
+            >
+              📷 Увімкнути камеру
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={stopCamera}
+                style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,90,90,0.18)", border: "1px solid rgba(255,90,90,0.35)", color: "#fff", cursor: "pointer" }}
+              >
+                ⛔ Вимкнути камеру
               </button>
-            ) : (
-              <button className="btn danger" onClick={stopCamera}>
-                ✖ Вимкнути камеру
+
+              <button
+                onClick={capturePhoto}
+                style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,255,255,0.10)", border: "1px solid rgba(255,255,255,0.16)", color: "#fff", cursor: "pointer" }}
+              >
+                🎯 Зробити фото (листок по центру)
               </button>
-            )}
+            </>
+          )}
 
-            <button className="btn soft" onClick={takePhoto} disabled={!cameraOn}>
-              🎯 Зробити фото
-            </button>
+          <button
+            onClick={runAnalyze}
+            disabled={loading}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              background: "rgba(80,200,120,0.18)",
+              border: "1px solid rgba(80,200,120,0.35)",
+              color: "#fff",
+              cursor: loading ? "not-allowed" : "pointer",
+              opacity: loading ? 0.6 : 1,
+            }}
+          >
+            ⚡ {loading ? "Аналіз..." : "Запустити аналіз"}
+          </button>
 
-            <button className="btn primary" onClick={runAnalyze} disabled={busy}>
-              ⚡ Запустити аналіз
-            </button>
+          <button
+            onClick={clearAll}
+            style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.12)", color: "#fff", cursor: "pointer" }}
+          >
+            🧽 Очистити
+          </button>
 
-            <button className="btn ghost" onClick={clearAll} disabled={busy}>
-              🧹 Очистити
-            </button>
-          </div>
-        </div>
-
-        <div className="hint">
-          {authed ? "✅ Ти увійшов — можна зберігати в папки." : "Щоб зберігати в «Мої перевірені» і бачити папки — увійди."}
-        </div>
-
-        {msg ? <div className="status">{msg}</div> : null}
-      </div>
-
-      <div className="grid2">
-        <div className="card">
-          <div className="cardTitle">Попередній перегляд</div>
-
-          <div className="mediaBox">
-            {cameraOn ? (
-              <video ref={videoRef} className="video" autoPlay playsInline muted />
-            ) : previewUrl ? (
-              <img className="img" src={previewUrl} alt="preview" />
-            ) : (
-              <div className="empty">Немає зображення.<br />Завантаж фото або увімкни камеру.</div>
-            )}
-          </div>
-
-          <div className="row">
-            <div className="label">Папка:</div>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ opacity: 0.85 }}>Папка:</div>
             <select
-              className="select"
               value={folderId}
               onChange={(e) => setFolderId(e.target.value)}
-              disabled={!authed || folders.length === 0}
+              disabled={!isAuthed()}
+              style={{
+                minWidth: 180,
+                padding: "9px 12px",
+                borderRadius: 12,
+                background: "rgba(255,255,255,0.06)",
+                color: "#fff",
+                border: "1px solid rgba(255,255,255,0.12)",
+                outline: "none",
+              }}
             >
               <option value="">Без папки</option>
               {folders.map((f) => (
-                <option key={f.id} value={f.id}>
+                <option key={f.id} value={String(f.id)}>
                   {f.name}
                 </option>
               ))}
             </select>
 
-            <button className="btn star" onClick={saveToFolder} disabled={!authed || busy || !result?.analysisId}>
+            <button
+              onClick={saveToFolder}
+              disabled={!canSave}
+              title={!isAuthed() ? "Увійди, щоб зберігати" : (!result?.analysisId ? "Спочатку зроби аналіз" : "")}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 12,
+                background: canSave ? "rgba(255,215,0,0.14)" : "rgba(255,255,255,0.05)",
+                border: canSave ? "1px solid rgba(255,215,0,0.35)" : "1px solid rgba(255,255,255,0.10)",
+                color: "#fff",
+                cursor: canSave ? "pointer" : "not-allowed",
+                opacity: canSave ? 1 : 0.6,
+              }}
+            >
               ⭐ Зберегти в «Мої перевірені»
             </button>
           </div>
         </div>
 
-        <div className="card">
-          <div className="cardTitle">Результат</div>
+        {banner ? (
+          <div style={{ marginTop: 12, padding: "10px 12px", borderRadius: 12, background: "rgba(255,120,120,0.12)", border: "1px solid rgba(255,120,120,0.22)" }}>
+            {banner}
+          </div>
+        ) : null}
+      </div>
+
+      {/* нижній контент */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        {/* preview */}
+        <div style={{ ...cardStyle }}>
+          <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 10 }}>Попередній перегляд</div>
+
+          <div
+            style={{
+              borderRadius: 16,
+              overflow: "hidden",
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(0,0,0,0.25)",
+              height: 360,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            {cameraOn ? (
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              />
+            ) : previewUrl ? (
+              <img src={previewUrl} alt="preview" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            ) : (
+              <div style={{ opacity: 0.75, padding: 18, textAlign: "center" }}>
+                Немає зображення. <br /> Завантаж фото або увімкни камеру.
+              </div>
+            )}
+          </div>
+
+          {cameraOn ? (
+            <div style={{ marginTop: 10, opacity: 0.85 }}>
+              Якщо чорний екран: перевір дозвіл камери у браузері (значок камери біля адреси).
+            </div>
+          ) : null}
+        </div>
+
+        {/* result */}
+        <div style={{ ...cardStyle }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+            <div style={{ fontSize: 18, fontWeight: 800 }}>Результат</div>
+
+            {confidencePct !== null ? (
+              <div
+                style={{
+                  marginLeft: "auto",
+                  padding: "6px 10px",
+                  borderRadius: 999,
+                  background: "rgba(255,255,255,0.08)",
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  fontWeight: 800,
+                }}
+              >
+                {confidencePct}%
+              </div>
+            ) : null}
+          </div>
 
           {!result ? (
-            <div className="muted">Після аналізу тут буде відповідь сервера.</div>
-          ) : (
-            <div className="resultBox">
-              <div><b>Рослина:</b> {result.plantName || "—"}</div>
-              <div><b>Стан / Хвороба:</b> {result.diseaseName || result.predictedKey || "—"}</div>
-              <div><b>Ймовірність:</b> {typeof result.confidence === "number" ? `${Math.round(result.confidence * 100)}%` : (result.confidence ?? "—")}</div>
-
-              {result.analysisId ? (
-                <div className="mutedSmall">analysisId: {result.analysisId}</div>
-              ) : (
-                <div className="warnSmall">⚠️ Сервер не повернув analysisId — збереження в папку не буде працювати.</div>
-              )}
+            <div style={{ opacity: 0.8 }}>
+              Після аналізу тут буде відповідь сервера (рослина, хвороба, ймовірність, опис і рекомендації).
             </div>
+          ) : (
+            <>
+              <div style={{ lineHeight: 1.9, fontSize: 16 }}>
+                <div><b>Рослина:</b> {result.plantName || "Unknown"}</div>
+                <div><b>Стан / Хвороба:</b> {diseaseTitle || result.diseaseName || "Unknown"}</div>
+                <div><b>Ймовірність:</b> {confidencePct !== null ? `${confidencePct}%` : "—"}</div>
+                {result.analysisId ? (
+                  <div style={{ opacity: 0.8, marginTop: 6 }}>analysisId: {result.analysisId}</div>
+                ) : null}
+              </div>
+
+              {/* опис/рекомендації */}
+              {(diseaseDesc || diseaseTips) ? (
+                <div style={{ marginTop: 14, display: "grid", gap: 12 }}>
+                  {diseaseDesc ? (
+                    <div style={{ padding: 12, borderRadius: 14, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.10)" }}>
+                      <div style={{ fontWeight: 900, marginBottom: 6 }}>📌 Опис</div>
+                      <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{diseaseDesc}</div>
+                    </div>
+                  ) : null}
+
+                  {diseaseTips ? (
+                    <div style={{ padding: 12, borderRadius: 14, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.10)" }}>
+                      <div style={{ fontWeight: 900, marginBottom: 6 }}>🧪 Рекомендації</div>
+                      <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{diseaseTips}</div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div style={{ marginTop: 12, opacity: 0.7 }}>
+                  Немає опису/рекомендацій для цього ключа в таблиці <b>diseases</b>.
+                </div>
+              )}
+
+              {/* маленький прев’ю url з сервера, якщо є */}
+              {result.imageUrl ? (
+                <div style={{ marginTop: 12, opacity: 0.75 }}>
+                  <span>🖼️ Збережене зображення: </span>
+                  <a href={toImageUrl(result.imageUrl)} target="_blank" rel="noreferrer" style={{ color: "#b8d4ff" }}>
+                    відкрити
+                  </a>
+                </div>
+              ) : null}
+            </>
           )}
         </div>
       </div>

@@ -1,62 +1,76 @@
-// client/src/services/api.js
-import { getToken, clearAuth } from "./auth.js";
+import { getToken, clearToken } from "./auth";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+const SERVER_BASE = API_BASE.replace(/\/api\/?$/i, "");
 
-export function getErrorMessage(err) {
-  if (!err) return "Невідома помилка";
-
-  // наш throw з apiRequest
-  if (typeof err === "object") {
-    if (err.data?.message) return err.data.message;
-    if (err.data?.error) return err.data.error;
-    if (err.message) return err.message;
-  }
-
-  if (typeof err === "string") return err;
-  return "Сталася помилка";
+// щоб формувати URL до /uploads
+export function getServerBaseUrl() {
+  return SERVER_BASE;
 }
 
-async function apiRequest(method, path, body, options = {}) {
-  const url = path.startsWith("http") ? path : `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}`;
-  const headers = new Headers(options.headers || {});
+export function getErrorMessage(e) {
+  if (!e) return "Помилка";
+  if (typeof e === "string") return e;
+  if (e?.message) return e.message;
+  return "Помилка";
+}
+
+async function readJsonSafe(res) {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function request(method, url, body, { isForm = false } = {}) {
   const token = getToken();
 
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const headers = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (!isForm) headers["Content-Type"] = "application/json";
 
-  const fetchOptions = {
+  const fullUrl = url.startsWith("http") ? url : `${API_BASE}${url}`;
+
+  try {
+    // eslint-disable-next-line no-console
+    console.log("API >", method, fullUrl, isForm ? "FormData" : body ?? "");
+  } catch {}
+
+  const res = await fetch(fullUrl, {
     method,
     headers,
-    credentials: "include",
-  };
+    body: isForm ? body : body ? JSON.stringify(body) : undefined,
+  });
 
-  // body
-  if (body instanceof FormData) {
-    fetchOptions.body = body; // Content-Type не ставимо
-  } else if (body !== undefined && body !== null) {
-    headers.set("Content-Type", "application/json");
-    fetchOptions.body = JSON.stringify(body);
+  if (res.status === 401) {
+    clearToken();
   }
 
-  console.log(`API > ${method} ${url}`, body instanceof FormData ? "FormData" : body ?? "");
-
-  const res = await fetch(url, fetchOptions);
-
-  const contentType = res.headers.get("content-type") || "";
-  const isJson = contentType.includes("application/json");
-
-  const data = isJson ? await res.json().catch(() => null) : await res.text().catch(() => "");
+  const data = await readJsonSafe(res);
 
   if (!res.ok) {
-    // якщо токен протух — чистимо
-    if (res.status === 401) clearAuth();
-    throw { status: res.status, data, message: `HTTP ${res.status}` };
+    const msg = data?.message || data?.error || `HTTP ${res.status}`;
+    throw new Error(msg);
   }
 
   return data;
 }
 
-export const apiGet = (path, options) => apiRequest("GET", path, null, options);
-export const apiPost = (path, body, options) => apiRequest("POST", path, body, options);
-export const apiPut = (path, body, options) => apiRequest("PUT", path, body, options);
-export const apiDelete = (path, body, options) => apiRequest("DELETE", path, body, options);
+// ✅ Backward-compatible named exports (щоб старі файли типу Login.jsx не ламались)
+export const apiGet = (url) => request("GET", url);
+export const apiPost = (url, body) => request("POST", url, body);
+export const apiPut = (url, body) => request("PUT", url, body);
+export const apiDelete = (url) => request("DELETE", url);
+export const apiPostForm = (url, formData) => request("POST", url, formData, { isForm: true });
+
+// ✅ Default export теж залишаємо (для нового коду)
+const api = {
+  get: apiGet,
+  post: apiPost,
+  put: apiPut,
+  del: apiDelete,
+  postForm: apiPostForm,
+};
+
+export default api;
