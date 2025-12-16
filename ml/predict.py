@@ -1,152 +1,175 @@
-import sys
-import json
 import os
-from pathlib import Path
 
-# --- зробимо TF максимально "тихим" ---
+# ВАЖЛИВО: забороняємо Transformers чіпати TensorFlow/Keras
+os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-import numpy as np
-import tensorflow as tf
+import json
+import sys
+from typing import Any, Dict, List
 from PIL import Image
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "model.h5"
-LABELS_PATH = BASE_DIR / "labels.json"
+DISEASE_MODEL = os.getenv("DISEASE_MODEL", "mesabo/agri-plant-disease-resnet50")
+CLIP_MODEL = os.getenv("CLIP_MODEL", "openai/clip-vit-base-patch32")
 
-IMG_SIZE = 224
-TOP_K = 3
+PLANT_MIN_SCORE = float(os.getenv("PLANT_MIN_SCORE", "0.55"))
+TOP_K = int(os.getenv("TOP_K", "3"))
 
-# М'якший поріг (під темні листки теж)
-PLANT_MIN_RATIO = 0.006   # 0.6% кадру має виглядати як "рослинна область"
-UNSURE_THRESHOLD = 0.60   # якщо top1 < 0.60 -> "не впевнено"
-
-
-def center_crop_square(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = (h - side) // 2
-    return img.crop((left, top, left + side, top + side))
-
-
-def plant_bbox_crop(img: Image.Image) -> tuple[Image.Image, float]:
-    """
-    Детектор "листок у кадрі" (стабільніше ніж просто green):
-    - ExG = 2G - R - B (ловить темно-зелені, хворі, різні відтінки)
-    - HSV (зелений відтінок + насиченість/яскравість)
-    Повертає (cropped_image, plant_ratio).
-    """
-    arr = np.array(img.convert("RGB"))
-    r = arr[..., 0].astype(np.int16)
-    g = arr[..., 1].astype(np.int16)
-    b = arr[..., 2].astype(np.int16)
-
-    # ExG (м'яко)
-    exg = 2 * g - r - b
-    exg_mask = (exg > 15) & (g > 35)
-
-    # HSV green-ish (PIL HSV: H 0..255)
-    hsv = np.array(img.convert("HSV"))
-    h = hsv[..., 0].astype(np.int16)
-    s = hsv[..., 1].astype(np.int16)
-    v = hsv[..., 2].astype(np.int16)
-
-    # приблизно зелений діапазон + м'які пороги
-    hsv_green = (h >= 20) & (h <= 85) & (s >= 25) & (v >= 25)
-
-    mask = exg_mask | hsv_green
-    plant_ratio = float(mask.mean())
-
-    # якщо рослинної області мало — повертаємо центр-кроп
-    if plant_ratio < PLANT_MIN_RATIO:
-        return center_crop_square(img), plant_ratio
-
-    ys, xs = np.where(mask)
-    y1, y2 = ys.min(), ys.max()
-    x1, x2 = xs.min(), xs.max()
-
-    # padding 12%
-    H, W = arr.shape[0], arr.shape[1]
-    pad_y = int((y2 - y1) * 0.12)
-    pad_x = int((x2 - x1) * 0.12)
-
-    y1 = max(0, y1 - pad_y)
-    y2 = min(H - 1, y2 + pad_y)
-    x1 = max(0, x1 - pad_x)
-    x2 = min(W - 1, x2 + pad_x)
-
-    cropped = img.crop((x1, y1, x2 + 1, y2 + 1))
-    cropped = center_crop_square(cropped)
-    return cropped, plant_ratio
+PLANT_LABELS = [
+    "a photo of a plant",
+    "a photo of a plant leaf",
+    "a photo of a leaf",
+    "a photo of a flower",
+    "a photo of a tree",
+]
+NONPLANT_LABELS = [
+    "a photo of a person",
+    "a photo of a face",
+    "a photo of an animal",
+    "a photo of food",
+    "a photo of a car",
+    "a photo of a building",
+    "a photo of a document",
+    "a photo of a random object",
+]
+CANDIDATE_LABELS = PLANT_LABELS + NONPLANT_LABELS
 
 
-def load_labels() -> dict[int, str]:
-    with open(LABELS_PATH, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    return {int(k): v for k, v in raw.items()}
+def emit(obj: Dict[str, Any], exit_code: int = 0) -> None:
+    # ASCII stdout (без проблем кодування в Node)
+    print(json.dumps(obj, ensure_ascii=True))
+    sys.exit(exit_code)
 
 
-def preprocess(img_path: str) -> tuple[np.ndarray, float]:
-    img = Image.open(img_path).convert("RGB")
-    cropped, plant_ratio = plant_bbox_crop(img)
-    cropped = cropped.resize((IMG_SIZE, IMG_SIZE))
-    x = np.array(cropped).astype(np.float32) / 255.0
-    x = np.expand_dims(x, axis=0)
-    return x, plant_ratio
+def safe_open_image(image_path: str) -> Image.Image:
+    try:
+        return Image.open(image_path).convert("RGB")
+    except Exception:
+        emit(
+            {
+                "ok": False,
+                "reason": "bad_image",
+                "message": "Не вдалося прочитати зображення (пошкоджений файл або не-картинка).",
+            },
+            0,
+        )
 
 
-def main():
+def clip_gate(image: Image.Image) -> Dict[str, Any]:
+    try:
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+    except Exception as e:
+        return {"ok": False, "reason": "clip_missing", "message": f"CLIP import error: {e}"}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+    model = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
+    model.eval()
+
+    inputs = processor(text=CANDIDATE_LABELS, images=image, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = outputs.logits_per_image.softmax(dim=1).detach().cpu().numpy()[0]
+
+    scores = {CANDIDATE_LABELS[i]: float(probs[i]) for i in range(len(CANDIDATE_LABELS))}
+    plant_score = sum(scores[lbl] for lbl in PLANT_LABELS)
+
+    best_label = max(scores, key=scores.get)
+    best_score = scores[best_label]
+
+    return {
+        "ok": True,
+        "plant_score": plant_score,
+        "best_clip_label": best_label,
+        "best_clip_score": best_score,
+        "device": device,
+    }
+
+
+def disease_predict(image: Image.Image, top_k: int) -> Dict[str, Any]:
+    try:
+        import torch
+        from transformers import pipeline
+    except Exception as e:
+        return {"ok": False, "reason": "hf_missing", "message": f"transformers/torch import error: {e}"}
+
+    device = 0 if torch.cuda.is_available() else -1
+
+    # ВАЖЛИВО: framework="pt" -> тільки PyTorch
+    pipe = pipeline(
+        "image-classification",
+        model=DISEASE_MODEL,
+        device=device,
+        framework="pt",
+    )
+
+    preds = pipe(image, top_k=top_k)
+
+    top: List[Dict[str, Any]] = [{"label": p.get("label", ""), "score": float(p.get("score", 0.0))} for p in preds]
+    best = top[0] if top else {"label": None, "score": None}
+
+    return {
+        "ok": True,
+        "predicted_key": best["label"],
+        "confidence": best["score"],
+        "top": top,
+        "model": DISEASE_MODEL,
+    }
+
+
+def main() -> None:
     if len(sys.argv) < 2:
-        sys.stdout.write(json.dumps({"error": "No image path provided"}, ensure_ascii=False))
-        return
+        emit({"ok": False, "reason": "no_arg", "message": "Usage: predict.py <image_path>"}, 0)
 
-    img_path = sys.argv[1]
+    image_path = sys.argv[1]
+    if not os.path.exists(image_path):
+        emit({"ok": False, "reason": "no_file", "message": "Image file not found", "path": image_path}, 0)
 
-    if not MODEL_PATH.exists():
-        sys.stdout.write(json.dumps({"error": f"Model not found: {str(MODEL_PATH)}"}, ensure_ascii=False))
-        return
+    image = safe_open_image(image_path)
 
-    if not LABELS_PATH.exists():
-        sys.stdout.write(json.dumps({"error": f"Labels not found: {str(LABELS_PATH)}"}, ensure_ascii=False))
-        return
+    gate = clip_gate(image)
+    if not gate.get("ok"):
+        emit(gate, 0)
 
-    # load model + labels
-    model = tf.keras.models.load_model(MODEL_PATH)
-    labels = load_labels()
+    plant_score = float(gate["plant_score"])
+    if plant_score < PLANT_MIN_SCORE:
+        emit(
+            {
+                "ok": False,
+                "reason": "not_plant",
+                "message": "Схоже, на фото не рослина/листок. Спробуй сфотографувати ближче листок при нормальному освітленні.",
+                "plant_score": plant_score,
+                "best_clip_label": gate.get("best_clip_label"),
+                "best_clip_score": gate.get("best_clip_score"),
+            },
+            0,
+        )
 
-    x, plant_ratio = preprocess(img_path)
+    dis = disease_predict(image, TOP_K)
+    if not dis.get("ok"):
+        emit(dis, 0)
 
-    # якщо рослину не бачимо — одразу віддаємо plant_detected=false
-    if plant_ratio < PLANT_MIN_RATIO:
-        sys.stdout.write(json.dumps({
-            "plant_detected": False,
-            "reason": "Plant/leaf not detected (low plant area in frame)",
-            "plant_ratio": plant_ratio
-        }, ensure_ascii=False))
-        return
-
-    preds = model.predict(x, verbose=0)[0]   # verbose=0 щоб не ламати JSON
-    top_idx = np.argsort(preds)[::-1][:TOP_K]
-
-    top = []
-    for i in top_idx:
-        top.append({
-            "key": labels.get(int(i), f"class_{int(i)}"),
-            "confidence": float(preds[i])
-        })
-
-    best = top[0]
-    is_unsure = best["confidence"] < UNSURE_THRESHOLD
-
-    sys.stdout.write(json.dumps({
-        "plant_detected": True,
-        "unsure": bool(is_unsure),
-        "plant_ratio": plant_ratio,
-        "predictedKey": best["key"],
-        "confidence": float(best["confidence"]),
-        "top": top
-    }, ensure_ascii=False))
+    emit(
+        {
+            "ok": True,
+            "predicted_key": dis.get("predicted_key"),
+            "confidence": dis.get("confidence"),
+            "top": dis.get("top", []),
+            "plant_score": plant_score,
+            "best_clip_label": gate.get("best_clip_label"),
+            "best_clip_score": gate.get("best_clip_score"),
+            "meta": {
+                "disease_model": dis.get("model"),
+                "clip_model": CLIP_MODEL,
+                "plant_min_score": PLANT_MIN_SCORE,
+            },
+        },
+        0,
+    )
 
 
 if __name__ == "__main__":

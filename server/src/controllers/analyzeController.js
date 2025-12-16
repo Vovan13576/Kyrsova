@@ -1,5 +1,4 @@
 import fs from "fs";
-import path from "path";
 import { spawn } from "child_process";
 import pgPkg from "pg";
 
@@ -42,6 +41,11 @@ function splitPredictedKey(predictedKey) {
   return { plantName, diseaseName, isHealthy };
 }
 
+/**
+ * Запускає Python predict.py і очікує JSON у stdout.
+ * Важливо: predict.py тепер може повертати ok:false (це НЕ помилка),
+ * тому ми НЕ падаємо, якщо code=0 і JSON валідний.
+ */
 function runPythonPredict({ pythonPath, scriptPath, imagePath }) {
   return new Promise((resolve, reject) => {
     const args = ["-u", scriptPath, imagePath];
@@ -54,16 +58,22 @@ function runPythonPredict({ pythonPath, scriptPath, imagePath }) {
     proc.stderr.on("data", (d) => (err += d.toString("utf-8")));
 
     proc.on("close", (code) => {
+      const text = (out || "").trim();
+
+      // Якщо python впав реально
       if (code !== 0) {
-        return reject(new Error(`ML process exit code=${code}\n${err || out}`));
+        return reject(new Error(`ML process exit code=${code}\n${err || text}`));
       }
 
-      const text = out.trim();
       try {
         const json = JSON.parse(text);
+        // Додаємо stderr як debug (не обов'язково, але іноді корисно)
+        if (err && !json._stderr) json._stderr = err;
         resolve(json);
       } catch (e) {
-        reject(new Error(`ML output is not JSON.\nstdout:\n${text}\nstderr:\n${err}`));
+        reject(
+          new Error(`ML output is not JSON.\nstdout:\n${text}\nstderr:\n${err}`)
+        );
       }
     });
   });
@@ -74,14 +84,12 @@ async function fetchDiseaseInfo(pool, predictedKey) {
   if (!predictedKey) return null;
 
   const attempts = [
-    // найімовірніший варіант
     { sql: `SELECT title, description, tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
-    // інші популярні назви
     { sql: `SELECT title, description, tips FROM public.diseases WHERE predicted_key = $1 LIMIT 1`, map: (r) => r },
     { sql: `SELECT title, description, recommendations AS tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
     { sql: `SELECT title, description, recommendations AS tips FROM public.diseases WHERE predicted_key = $1 LIMIT 1`, map: (r) => r },
     { sql: `SELECT name AS title, description, tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
-    { sql: `SELECT name AS title, description, recommendations AS tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
+    { sql: `SELECT name AS title, description, recommendations AS tips FROM public.diseases WHERE predicted_key = $1 LIMIT 1`, map: (r) => r },
   ];
 
   for (const a of attempts) {
@@ -138,12 +146,37 @@ export async function analyzePlant(req, res) {
 
     const ml = await runPythonPredict({ pythonPath, scriptPath, imagePath });
 
-    const predictedKey = ml.predicted_key ?? ml.predictedKey ?? ml.key ?? null;
-    const confidenceRaw = ml.confidence ?? ml.score ?? ml.prob ?? null;
+    // ✅ НОВЕ: якщо ML каже "це не рослина" або інша причина — просто повертаємо
+    // (і НЕ записуємо як валідний аналіз хвороби)
+    if (ml && ml.ok === false) {
+      return res.json({
+        ok: false,
+        reason: ml.reason || "ml_rejected",
+        message: ml.message || "Модель відхилила зображення.",
+        plant_score: ml.plant_score ?? null,
+        best_clip_label: ml.best_clip_label ?? null,
+        best_clip_score: ml.best_clip_score ?? null,
+        raw: ml,
+        image_path: imagePath,
+      });
+    }
+
+    const predictedKey = ml?.predicted_key ?? ml?.predictedKey ?? ml?.key ?? null;
+    const confidenceRaw = ml?.confidence ?? ml?.score ?? ml?.prob ?? null;
     const confidence = confidenceRaw === null ? null : Number(confidenceRaw);
 
-    const { plantName, diseaseName, isHealthy } = splitPredictedKey(predictedKey);
+    // ✅ НОВЕ: якщо раптом predictedKey порожній — теж м’яко повернемо
+    if (!predictedKey) {
+      return res.json({
+        ok: false,
+        reason: "no_prediction",
+        message: "Не вдалося отримати прогноз від моделі.",
+        raw: ml,
+        image_path: imagePath,
+      });
+    }
 
+    const { plantName, diseaseName, isHealthy } = splitPredictedKey(predictedKey);
     const userId = req.user?.id ?? null;
 
     let analysisId = null;
@@ -162,13 +195,12 @@ export async function analyzePlant(req, res) {
       console.error("DB insert analysis_results error:", dbErr);
     }
 
-    // ✅ додали: підтягуємо опис/рекомендації
+    // ✅ підтягуємо опис/рекомендації
     let disease = null;
     try {
       const pool = getPool();
       disease = await fetchDiseaseInfo(pool, predictedKey);
-    } catch (e) {
-      // не валимо аналіз, якщо diseases не читається
+    } catch {
       disease = null;
     }
 
@@ -180,9 +212,9 @@ export async function analyzePlant(req, res) {
       plantName,
       diseaseName,
       isHealthy,
-      disease, // ✅ важливо для Analyze.jsx
+      disease,
       raw: ml,
-      image_path: imagePath, // для превʼю/історії
+      image_path: imagePath,
     });
   } catch (e) {
     console.error("analyze error:", e);
@@ -195,12 +227,14 @@ export async function analyzePlant(req, res) {
 }
 
 // =========================
-// POST /api/analyze/verify
-// body: { analysisId, verified }
+// POST /api/analyze/:id/verify
+// body (опц.): { verified } або { analysisId, verified }
 // =========================
 export async function verifyAnalysis(req, res) {
   try {
-    const { analysisId, verified } = req.body || {};
+    const body = req.body || {};
+    const analysisId = body.analysisId || req.params?.id;
+    const verified = body.verified;
 
     if (!analysisId) {
       return res.status(400).json({ ok: false, message: "analysisId is required" });
