@@ -1,119 +1,92 @@
 // client/src/services/api.js
-
-// API base (з /api)
-const API_BASE_URL =
-  (typeof import.meta !== "undefined" &&
-    import.meta.env &&
-    import.meta.env.VITE_API_URL) ||
+const API_BASE =
+  import.meta.env.VITE_API_URL?.trim() ||
   "http://localhost:5000/api";
 
-// ✅ треба для Analyze.jsx: базовий URL сервера БЕЗ /api
-export function getServerBaseUrl() {
-  // прибираємо /api або /api/
-  return String(API_BASE_URL).replace(/\/api\/?$/i, "");
-}
-
-// (може бути корисно в інших місцях)
-export function getApiBaseUrl() {
-  return API_BASE_URL;
+function buildUrl(path) {
+  if (!path) return API_BASE;
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 function getToken() {
   return (
     localStorage.getItem("pdw_token") ||
-    localStorage.getItem("token") ||
     localStorage.getItem("accessToken") ||
+    localStorage.getItem("token") ||
     ""
   );
 }
 
-export function getErrorMessage(err) {
-  if (!err) return "Unknown error";
-  if (typeof err === "string") return err;
-  return err?.message || err?.error || "Unknown error";
-}
-
-async function parseResponse(res) {
-  const contentType = res.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    return await res.json().catch(() => ({}));
-  }
-  const text = await res.text().catch(() => "");
-  return text ? { message: text } : {};
-}
-
-async function request(method, path, body, opts = {}) {
-  const url = path.startsWith("http") ? path : `${API_BASE_URL}${path}`;
+function makeHeaders(extra) {
+  const h = { ...(extra || {}) };
   const token = getToken();
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
+}
 
-  const headers = {
-    ...(opts.headers || {}),
-  };
-
-  const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
-
-  if (!isFormData && body !== undefined && body !== null) {
-    headers["Content-Type"] = "application/json";
-  }
-
-  if (token && !headers.Authorization) {
-    headers.Authorization = `Bearer ${token}`;
-  }
-
-  const fetchOptions = {
+async function request(method, path, body, headers) {
+  const res = await fetch(buildUrl(path), {
     method,
-    headers,
-    credentials: "include",
-    ...opts,
-  };
+    headers: makeHeaders(headers),
+    body,
+  });
 
-  if (body !== undefined && body !== null) {
-    fetchOptions.body = isFormData ? body : JSON.stringify(body);
-  }
+  const ct = res.headers.get("content-type") || "";
+  const isJson = ct.includes("application/json");
 
-  console.log("API >", method, url);
-
-  const res = await fetch(url, fetchOptions);
-  const data = await parseResponse(res);
+  const data = isJson ? await res.json().catch(() => null) : await res.text().catch(() => "");
 
   if (!res.ok) {
     const msg =
-      data?.message ||
-      data?.error ||
-      `HTTP ${res.status} ${res.statusText}` ||
-      "Request failed";
-    const e = new Error(msg);
-    e.status = res.status;
-    e.data = data;
-    throw e;
+      (data && (data.message || data.error)) ||
+      (typeof data === "string" && data) ||
+      `HTTP ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
 
   return data;
 }
 
-// Named exports (для import { apiPost } ...)
-export const apiGet = (path, opts) => request("GET", path, undefined, opts);
-export const apiPost = (path, body, opts) => request("POST", path, body, opts);
-export const apiPut = (path, body, opts) => request("PUT", path, body, opts);
-export const apiDelete = (path, opts) => request("DELETE", path, undefined, opts);
+// ---- named helpers that your components expect ----
+export function getServerBaseUrl() {
+  // turns "http://localhost:5000/api" -> "http://localhost:5000"
+  return API_BASE.replace(/\/api\/?$/i, "");
+}
 
-// FormData helpers (для Analyze.jsx: api.postForm(...))
-export const apiPostForm = (path, formData, opts) =>
-  request("POST", path, formData, opts);
+export function getErrorMessage(e) {
+  if (!e) return "Невідома помилка";
+  return (
+    e?.data?.message ||
+    e?.data?.error ||
+    e?.message ||
+    (typeof e === "string" ? e : "Помилка")
+  );
+}
 
-export const apiPutForm = (path, formData, opts) =>
-  request("PUT", path, formData, opts);
-
-// Default export (для import api from ...; api.postForm(...))
+// ---- main api object ----
 const api = {
-  get: apiGet,
-  post: apiPost,
-  put: apiPut,
-  delete: apiDelete,
-  del: apiDelete,
-
-  postForm: apiPostForm,
-  putForm: apiPutForm,
+  get: (path) => request("GET", path),
+  post: (path, json) =>
+    request("POST", path, JSON.stringify(json ?? {}), {
+      "Content-Type": "application/json",
+    }),
+  put: (path, json) =>
+    request("PUT", path, JSON.stringify(json ?? {}), {
+      "Content-Type": "application/json",
+    }),
+  del: (path) => request("DELETE", path),
+  postForm: (path, formData) => request("POST", path, formData),
 };
 
 export default api;
+
+// extra named exports (для сумісності з твоїми файлами типу Login.jsx)
+export const apiGet = api.get;
+export const apiPost = api.post;
+export const apiPut = api.put;
+export const apiDelete = api.del;
+export const apiPostForm = api.postForm;

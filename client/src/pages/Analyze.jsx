@@ -1,6 +1,7 @@
+// client/src/Analyze.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import api, { getServerBaseUrl, getErrorMessage } from "../services/api";
-import { isAuthed } from "../services/auth";
+import api, { getServerBaseUrl, getErrorMessage } from "../services/api.js";
+import { isAuthed } from "../services/auth.js";
 
 const cardStyle = {
   background: "rgba(255,255,255,0.06)",
@@ -15,12 +16,10 @@ function toImageUrl(imagePathOrUrl) {
   if (!imagePathOrUrl) return null;
   if (imagePathOrUrl.startsWith("http")) return imagePathOrUrl;
 
-  // якщо вже /uploads/xxx
   if (imagePathOrUrl.startsWith("/uploads/")) {
     return `${getServerBaseUrl()}${imagePathOrUrl}`;
   }
 
-  // якщо filename
   const justName = imagePathOrUrl.replaceAll("\\", "/").split("/").pop();
   return `${getServerBaseUrl()}/uploads/${justName}`;
 }
@@ -49,13 +48,14 @@ export default function Analyze() {
       const data = await api.get("/folders");
       const items = data?.items || data?.folders || data || [];
       setFolders(Array.isArray(items) ? items : []);
-    } catch (e) {
+    } catch {
       // тихо
     }
   }
 
   useEffect(() => {
     loadFolders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -69,19 +69,35 @@ export default function Analyze() {
   async function startCamera() {
     try {
       setBanner("");
-      // якщо вже увімкнено — перезапускаємо чисто
       stopCamera();
 
       setCameraOn(true);
 
-      const constraints = {
-        video: {
-          facingMode: "environment",
+      const tryConstraints = [
+        {
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
         },
-        audio: false,
-      };
+        { video: true, audio: false },
+      ];
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      let stream = null;
+      for (const c of tryConstraints) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          stream = await navigator.mediaDevices.getUserMedia(c);
+          break;
+        } catch {
+          stream = null;
+        }
+      }
+
+      if (!stream) throw new Error("no camera stream");
+
       streamRef.current = stream;
 
       const video = videoRef.current;
@@ -91,15 +107,14 @@ export default function Analyze() {
       video.muted = true;
       video.playsInline = true;
 
-      // важливо: чекати metadata, потім play()
       video.onloadedmetadata = async () => {
         try {
           await video.play();
         } catch {
-          // інколи браузер блокує — але зазвичай після кліку дозволяє
+          // autoplay може блокнутись — але після кліку зазвичай ок
         }
       };
-    } catch (e) {
+    } catch {
       setCameraOn(false);
       setBanner("Не вдалося відкрити камеру. Дозволь доступ у браузері.");
     }
@@ -113,12 +128,15 @@ export default function Analyze() {
         video.srcObject = null;
         video.onloadedmetadata = null;
       }
+
       const stream = streamRef.current;
       if (stream) {
         stream.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
       }
-    } catch {}
+    } catch {
+      // ignore
+    }
     setCameraOn(false);
   }
 
@@ -127,6 +145,9 @@ export default function Analyze() {
     const f = e.target.files?.[0];
     if (!f) return;
 
+    // якщо вибрали файл — камеру вимикаємо, щоб не “жила”
+    stopCamera();
+
     setFile(f);
     setResult(null);
 
@@ -134,35 +155,60 @@ export default function Analyze() {
     setPreviewUrl(URL.createObjectURL(f));
   }
 
+  // ✅ Після фото — “заморожуємо” кадр (зупиняємо камеру)
   function capturePhoto() {
     try {
       setBanner("");
 
       const video = videoRef.current;
       const stream = streamRef.current;
+
       if (!video || !stream) {
         setBanner("Камера не увімкнена.");
         return;
       }
 
-      const w = video.videoWidth || 1280;
-      const h = video.videoHeight || 720;
+      if (!video.videoWidth || !video.videoHeight) {
+        setBanner("Камера ще завантажується. Спробуй ще раз через 1 секунду.");
+        return;
+      }
+
+      // важливо: одразу пауза — візуально “фіксує” кадр
+      video.pause?.();
+
+      const w = video.videoWidth;
+      const h = video.videoHeight;
 
       const canvas = document.createElement("canvas");
       canvas.width = w;
       canvas.height = h;
+
       const ctx = canvas.getContext("2d");
       ctx.drawImage(video, 0, 0, w, h);
 
-      canvas.toBlob((blob) => {
-        if (!blob) return;
-        const captured = new File([blob], `camera_${Date.now()}.png`, { type: "image/png" });
-        setFile(captured);
-        setResult(null);
+      canvas.toBlob(
+        (blob) => {
+          if (!blob) {
+            setBanner("Не вдалося отримати кадр з камери.");
+            return;
+          }
 
-        if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
-        setPreviewUrl(URL.createObjectURL(captured));
-      }, "image/png");
+          const captured = new File([blob], `camera_${Date.now()}.png`, {
+            type: "image/png",
+          });
+
+          setFile(captured);
+          setResult(null);
+
+          if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
+          setPreviewUrl(URL.createObjectURL(captured));
+
+          // ✅ і повністю зупиняємо камеру
+          stopCamera();
+        },
+        "image/png",
+        0.95
+      );
     } catch {
       setBanner("Не вдалося зробити фото з камери.");
     }
@@ -227,36 +273,72 @@ export default function Analyze() {
     setPreviewUrl("");
   }
 
-  const diseaseTitle = result?.disease?.title || (result?.diseaseName ?? "");
-  const diseaseDesc = result?.disease?.description || "";
-  const diseaseTips = result?.disease?.tips || "";
+  // ---- ОПИС/РЕКОМЕНДАЦІЇ: підтримуємо різні формати відповіді ----
+  const diseaseTitle =
+    result?.disease?.title ||
+    result?.diseaseTitle ||
+    result?.disease_name ||
+    result?.diseaseName ||
+    "";
+
+  const diseaseDesc =
+    result?.disease?.description ||
+    result?.description ||
+    result?.diseaseDescription ||
+    result?.disease_desc ||
+    "";
+
+  const diseaseTips =
+    result?.disease?.tips ||
+    result?.tips ||
+    result?.recommendations ||
+    result?.diseaseTips ||
+    result?.disease_tips ||
+    "";
 
   const confidencePct =
     result?.confidence === null || result?.confidence === undefined
       ? null
       : Math.round(Number(result.confidence) * (Number(result.confidence) > 1 ? 1 : 100));
 
+  const previewImgFromServer = toImageUrl(result?.image_path || result?.imagePath || "");
+
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto", padding: "22px 16px" }}>
-      {/* верхній блок керування */}
       <div style={{ ...cardStyle, marginBottom: 16 }}>
-        <div style={{ fontSize: 26, fontWeight: 800, marginBottom: 6 }}>Plant Disease Detection</div>
+        <div style={{ fontSize: 26, fontWeight: 800, marginBottom: 6 }}>
+          Plant Disease Detection
+        </div>
         <div style={{ opacity: 0.85, marginBottom: 14 }}>
           Завантаж фото або увімкни камеру, зроби кадр і запускай аналіз.
         </div>
 
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <label
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              background: "rgba(255,255,255,0.07)",
+              border: "1px solid rgba(255,255,255,0.12)",
+              color: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            📁 Вибрати файл
             <input type="file" accept="image/*" onChange={onPickFile} style={{ display: "none" }} />
-            <span style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)" }}>
-              📁 Вибрати файл
-            </span>
           </label>
 
           {!cameraOn ? (
             <button
               onClick={startCamera}
-              style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(70,120,255,0.20)", border: "1px solid rgba(70,120,255,0.35)", color: "#fff", cursor: "pointer" }}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 12,
+                background: "rgba(70,120,255,0.20)",
+                border: "1px solid rgba(70,120,255,0.35)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
             >
               📷 Увімкнути камеру
             </button>
@@ -264,14 +346,28 @@ export default function Analyze() {
             <>
               <button
                 onClick={stopCamera}
-                style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,90,90,0.18)", border: "1px solid rgba(255,90,90,0.35)", color: "#fff", cursor: "pointer" }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 12,
+                  background: "rgba(255,90,90,0.18)",
+                  border: "1px solid rgba(255,90,90,0.35)",
+                  color: "#fff",
+                  cursor: "pointer",
+                }}
               >
                 ⛔ Вимкнути камеру
               </button>
 
               <button
                 onClick={capturePhoto}
-                style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,255,255,0.10)", border: "1px solid rgba(255,255,255,0.16)", color: "#fff", cursor: "pointer" }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 12,
+                  background: "rgba(255,255,255,0.10)",
+                  border: "1px solid rgba(255,255,255,0.16)",
+                  color: "#fff",
+                  cursor: "pointer",
+                }}
               >
                 🎯 Зробити фото (листок по центру)
               </button>
@@ -296,13 +392,21 @@ export default function Analyze() {
 
           <button
             onClick={clearAll}
-            style={{ padding: "10px 14px", borderRadius: 12, background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.12)", color: "#fff", cursor: "pointer" }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              background: "rgba(255,255,255,0.07)",
+              border: "1px solid rgba(255,255,255,0.12)",
+              color: "#fff",
+              cursor: "pointer",
+            }}
           >
             🧽 Очистити
           </button>
 
           <div style={{ marginLeft: "auto", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ opacity: 0.85 }}>Папка:</div>
+
             <select
               value={folderId}
               onChange={(e) => setFolderId(e.target.value)}
@@ -328,7 +432,13 @@ export default function Analyze() {
             <button
               onClick={saveToFolder}
               disabled={!canSave}
-              title={!isAuthed() ? "Увійди, щоб зберігати" : (!result?.analysisId ? "Спочатку зроби аналіз" : "")}
+              title={
+                !isAuthed()
+                  ? "Увійди, щоб зберігати"
+                  : !result?.analysisId
+                  ? "Спочатку зроби аналіз"
+                  : ""
+              }
               style={{
                 padding: "10px 14px",
                 borderRadius: 12,
@@ -345,15 +455,21 @@ export default function Analyze() {
         </div>
 
         {banner ? (
-          <div style={{ marginTop: 12, padding: "10px 12px", borderRadius: 12, background: "rgba(255,120,120,0.12)", border: "1px solid rgba(255,120,120,0.22)" }}>
+          <div
+            style={{
+              marginTop: 12,
+              padding: "10px 12px",
+              borderRadius: 12,
+              background: "rgba(255,120,120,0.12)",
+              border: "1px solid rgba(255,120,120,0.22)",
+            }}
+          >
             {banner}
           </div>
         ) : null}
       </div>
 
-      {/* нижній контент */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-        {/* preview */}
         <div style={{ ...cardStyle }}>
           <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 10 }}>Попередній перегляд</div>
 
@@ -378,7 +494,11 @@ export default function Analyze() {
                 style={{ width: "100%", height: "100%", objectFit: "cover" }}
               />
             ) : previewUrl ? (
-              <img src={previewUrl} alt="preview" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              <img
+                src={previewUrl}
+                alt="preview"
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              />
             ) : (
               <div style={{ opacity: 0.75, padding: 18, textAlign: "center" }}>
                 Немає зображення. <br /> Завантаж фото або увімкни камеру.
@@ -386,14 +506,9 @@ export default function Analyze() {
             )}
           </div>
 
-          {cameraOn ? (
-            <div style={{ marginTop: 10, opacity: 0.85 }}>
-              Якщо чорний екран: перевір дозвіл камери у браузері (значок камери біля адреси).
-            </div>
-          ) : null}
+          {/* текст під камерою — прибрано */}
         </div>
 
-        {/* result */}
         <div style={{ ...cardStyle }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
             <div style={{ fontSize: 18, fontWeight: 800 }}>Результат</div>
@@ -420,45 +535,43 @@ export default function Analyze() {
             </div>
           ) : (
             <>
-              <div style={{ lineHeight: 1.9, fontSize: 16 }}>
-                <div><b>Рослина:</b> {result.plantName || "Unknown"}</div>
-                <div><b>Стан / Хвороба:</b> {diseaseTitle || result.diseaseName || "Unknown"}</div>
-                <div><b>Ймовірність:</b> {confidencePct !== null ? `${confidencePct}%` : "—"}</div>
+              <div style={{ lineHeight: 1.65 }}>
+                <div>
+                  <b>Рослина:</b> {result.plantName || "—"}
+                </div>
+                <div>
+                  <b>Стан / Хвороба:</b> {diseaseTitle || result.diseaseName || "—"}
+                </div>
                 {result.analysisId ? (
-                  <div style={{ opacity: 0.8, marginTop: 6 }}>analysisId: {result.analysisId}</div>
+                  <div style={{ opacity: 0.85, marginTop: 6 }}>analysisId: {result.analysisId}</div>
                 ) : null}
               </div>
 
-              {/* опис/рекомендації */}
               {(diseaseDesc || diseaseTips) ? (
-                <div style={{ marginTop: 14, display: "grid", gap: 12 }}>
+                <div style={{ marginTop: 14 }}>
                   {diseaseDesc ? (
-                    <div style={{ padding: 12, borderRadius: 14, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.10)" }}>
-                      <div style={{ fontWeight: 900, marginBottom: 6 }}>📌 Опис</div>
+                    <>
+                      <div style={{ fontWeight: 900, marginBottom: 6 }}>Опис</div>
                       <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{diseaseDesc}</div>
-                    </div>
+                    </>
                   ) : null}
 
                   {diseaseTips ? (
-                    <div style={{ padding: 12, borderRadius: 14, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.10)" }}>
-                      <div style={{ fontWeight: 900, marginBottom: 6 }}>🧪 Рекомендації</div>
+                    <>
+                      <div style={{ fontWeight: 900, marginTop: 12, marginBottom: 6 }}>Рекомендації</div>
                       <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{diseaseTips}</div>
-                    </div>
+                    </>
                   ) : null}
                 </div>
               ) : (
-                <div style={{ marginTop: 12, opacity: 0.7 }}>
-                  Немає опису/рекомендацій для цього ключа в таблиці <b>diseases</b>.
+                <div style={{ marginTop: 12, opacity: 0.75 }}>
+                  Немає опису/рекомендацій для цього ключа в таблиці diseases.
                 </div>
               )}
 
-              {/* маленький прев’ю url з сервера, якщо є */}
-              {result.imageUrl ? (
-                <div style={{ marginTop: 12, opacity: 0.75 }}>
-                  <span>🖼️ Збережене зображення: </span>
-                  <a href={toImageUrl(result.imageUrl)} target="_blank" rel="noreferrer" style={{ color: "#b8d4ff" }}>
-                    відкрити
-                  </a>
+              {previewImgFromServer ? (
+                <div style={{ marginTop: 14, opacity: 0.0, height: 0, overflow: "hidden" }}>
+                  {/* нічого не міняємо в UI, просто залишаю гачок якщо треба */}
                 </div>
               ) : null}
             </>

@@ -63,39 +63,43 @@ function runPythonPredict({ pythonPath, scriptPath, imagePath }) {
         const json = JSON.parse(text);
         resolve(json);
       } catch (e) {
-        reject(
-          new Error(
-            `ML output is not JSON.\nstdout:\n${text}\nstderr:\n${err}`
-          )
-        );
+        reject(new Error(`ML output is not JSON.\nstdout:\n${text}\nstderr:\n${err}`));
       }
     });
   });
 }
 
-async function findDiseaseByKey(predictedKey) {
+// ✅ дістаємо description/tips з таблиці diseases (різні можливі назви колонок)
+async function fetchDiseaseInfo(pool, predictedKey) {
   if (!predictedKey) return null;
-  const pool = getPool();
 
-  // спочатку точний збіг
-  const q1 = `
-    SELECT id, key, title, description, tips
-    FROM public.diseases
-    WHERE key = $1
-    LIMIT 1
-  `;
-  const r1 = await pool.query(q1, [predictedKey]);
-  if (r1.rows?.length) return r1.rows[0];
+  const attempts = [
+    // найімовірніший варіант
+    { sql: `SELECT title, description, tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
+    // інші популярні назви
+    { sql: `SELECT title, description, tips FROM public.diseases WHERE predicted_key = $1 LIMIT 1`, map: (r) => r },
+    { sql: `SELECT title, description, recommendations AS tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
+    { sql: `SELECT title, description, recommendations AS tips FROM public.diseases WHERE predicted_key = $1 LIMIT 1`, map: (r) => r },
+    { sql: `SELECT name AS title, description, tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
+    { sql: `SELECT name AS title, description, recommendations AS tips FROM public.diseases WHERE key = $1 LIMIT 1`, map: (r) => r },
+  ];
 
-  // на всяк випадок — нечутливо до регістру
-  const q2 = `
-    SELECT id, key, title, description, tips
-    FROM public.diseases
-    WHERE lower(key) = lower($1)
-    LIMIT 1
-  `;
-  const r2 = await pool.query(q2, [predictedKey]);
-  if (r2.rows?.length) return r2.rows[0];
+  for (const a of attempts) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await pool.query(a.sql, [predictedKey]);
+      if (r.rows && r.rows.length) {
+        const row = a.map(r.rows[0]);
+        return {
+          title: row.title || "",
+          description: row.description || "",
+          tips: row.tips || "",
+        };
+      }
+    } catch {
+      // якщо колонки не існують — пробуємо наступний варіант
+    }
+  }
 
   return null;
 }
@@ -106,14 +110,11 @@ async function findDiseaseByKey(predictedKey) {
 export async function analyzePlant(req, res) {
   try {
     if (!req.file?.path) {
-      return res
-        .status(400)
-        .json({ ok: false, message: "No image uploaded (field name: image)" });
+      return res.status(400).json({ ok: false, message: "No image uploaded (field name: image)" });
     }
 
     const pythonPath =
-      process.env.PYTHON_PATH ||
-      "C:/Kyrsova/plant-disease-web/ml/.venv/Scripts/python.exe";
+      process.env.PYTHON_PATH || "C:/Kyrsova/plant-disease-web/ml/.venv/Scripts/python.exe";
 
     const scriptPath =
       process.env.ML_PREDICT_PATH || "C:/Kyrsova/plant-disease-web/ml/predict.py";
@@ -143,18 +144,8 @@ export async function analyzePlant(req, res) {
 
     const { plantName, diseaseName, isHealthy } = splitPredictedKey(predictedKey);
 
-    // ✅ ВАЖЛИВО: підтягуємо опис і поради з БД
-    let disease = null;
-    try {
-      disease = await findDiseaseByKey(predictedKey);
-    } catch (e) {
-      console.warn("Disease lookup error:", e?.message || e);
-    }
-
-    // optionalAuthMiddleware може підставити req.user
     const userId = req.user?.id ?? null;
 
-    // ✅ Зберігаємо результат в analysis_results
     let analysisId = null;
     try {
       const pool = getPool();
@@ -171,7 +162,16 @@ export async function analyzePlant(req, res) {
       console.error("DB insert analysis_results error:", dbErr);
     }
 
-    // ✅ Повертаємо description/tips так, як фронт очікує
+    // ✅ додали: підтягуємо опис/рекомендації
+    let disease = null;
+    try {
+      const pool = getPool();
+      disease = await fetchDiseaseInfo(pool, predictedKey);
+    } catch (e) {
+      // не валимо аналіз, якщо diseases не читається
+      disease = null;
+    }
+
     return res.json({
       ok: true,
       analysisId,
@@ -180,14 +180,9 @@ export async function analyzePlant(req, res) {
       plantName,
       diseaseName,
       isHealthy,
-
-      // ВАЖЛИВО ДЛЯ Analyze.jsx:
-      description: disease?.description ?? null,
-      tips: disease?.tips ?? null,
-      diseaseTitle: disease?.title ?? null,
-      diseaseId: disease?.id ?? null,
-
+      disease, // ✅ важливо для Analyze.jsx
       raw: ml,
+      image_path: imagePath, // для превʼю/історії
     });
   } catch (e) {
     console.error("analyze error:", e);
@@ -200,7 +195,8 @@ export async function analyzePlant(req, res) {
 }
 
 // =========================
-// POST /api/analyze/:id/verify
+// POST /api/analyze/verify
+// body: { analysisId, verified }
 // =========================
 export async function verifyAnalysis(req, res) {
   try {
@@ -229,10 +225,6 @@ export async function verifyAnalysis(req, res) {
     return res.json({ ok: true, result: r.rows[0] });
   } catch (e) {
     console.error("verifyAnalysis error:", e);
-    return res.status(500).json({
-      ok: false,
-      message: "Verify failed",
-      error: String(e?.message || e),
-    });
+    return res.status(500).json({ ok: false, message: "Verify failed", error: String(e?.message || e) });
   }
 }
