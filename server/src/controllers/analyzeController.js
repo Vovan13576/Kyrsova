@@ -1,4 +1,5 @@
 import { execFile } from "child_process";
+import fs from "fs";
 import db from "../config/db.js";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -37,7 +38,7 @@ function splitKey(key) {
   return { plantName, diseaseName, isHealthy };
 }
 
-// POST /api/analyze  (⚠️ без auth — щоб аналіз працював навіть без логіну)
+// POST /api/analyze
 export const analyzePlant = async (req, res) => {
   try {
     if (!req.file?.path) return res.status(400).json({ message: "No image uploaded" });
@@ -45,15 +46,39 @@ export const analyzePlant = async (req, res) => {
     const imagePath = path.resolve(req.file.path);
     const imageFilename = req.file.filename;
 
+    // ✅ діагностика шляхів (щоб ти бачив ЧОМУ 500)
+    const pythonExists = fs.existsSync(PYTHON_PATH);
+    const scriptExists = fs.existsSync(ML_SCRIPT_PATH);
+
     console.log("▶ Image path:", imagePath);
-    console.log("▶ ML script:", ML_SCRIPT_PATH);
+    console.log("▶ Python path:", PYTHON_PATH, "exists:", pythonExists);
+    console.log("▶ ML script:", ML_SCRIPT_PATH, "exists:", scriptExists);
+
+    if (!pythonExists) {
+      return res.status(500).json({
+        message: "Python executable not found",
+        detail: PYTHON_PATH,
+      });
+    }
+    if (!scriptExists) {
+      return res.status(500).json({
+        message: "ML script not found",
+        detail: ML_SCRIPT_PATH,
+      });
+    }
 
     execFile(PYTHON_PATH, [ML_SCRIPT_PATH, imagePath], async (error, stdout, stderr) => {
       try {
+        if (stderr) console.log("PY STDERR:\n", String(stderr).slice(0, 4000));
+        if (stdout) console.log("PY STDOUT:\n", String(stdout).slice(0, 2000));
+
         if (error) {
-          console.error("❌ Python error:", error);
-          if (stderr) console.error("STDERR:\n", stderr);
-          return res.status(500).json({ message: "ML processing failed" });
+          console.error("❌ Python execFile error:", error);
+          return res.status(500).json({
+            message: "ML processing failed",
+            error: process.env.NODE_ENV === "production" ? undefined : String(error?.message || error),
+            stderr: process.env.NODE_ENV === "production" ? undefined : String(stderr || "").slice(0, 4000),
+          });
         }
 
         let result;
@@ -61,16 +86,18 @@ export const analyzePlant = async (req, res) => {
           result = safeParseJson(stdout);
         } catch (e) {
           console.error("❌ JSON parse error:", e?.message);
-          console.error("STDOUT was:\n", stdout);
-          if (stderr) console.error("STDERR:\n", stderr);
-          return res.status(500).json({ message: "Bad ML output (not JSON)" });
+          return res.status(500).json({
+            message: "Bad ML output (not JSON)",
+            stdout: process.env.NODE_ENV === "production" ? undefined : String(stdout || "").slice(0, 2000),
+            stderr: process.env.NODE_ENV === "production" ? undefined : String(stderr || "").slice(0, 2000),
+          });
         }
 
         if (!result) {
-          console.error("❌ Empty/invalid ML JSON");
-          console.error("STDOUT was:\n", stdout);
-          if (stderr) console.error("STDERR:\n", stderr);
-          return res.status(500).json({ message: "Empty ML result" });
+          return res.status(500).json({
+            message: "Empty ML result",
+            stdout: process.env.NODE_ENV === "production" ? undefined : String(stdout || "").slice(0, 2000),
+          });
         }
 
         if (result.error) return res.status(500).json({ message: result.error });
@@ -103,7 +130,7 @@ export const analyzePlant = async (req, res) => {
           });
         }
 
-        // якщо логіну нема — пишемо під user_id=1 (щоб демо працювало завжди)
+        // якщо логіну нема — пишемо під user_id=1 (демо)
         const userId = req.user?.id || 1;
 
         const inserted = await db.query(
@@ -148,16 +175,22 @@ export const analyzePlant = async (req, res) => {
         });
       } catch (innerErr) {
         console.error("❌ analyzePlant callback error:", innerErr);
-        return res.status(500).json({ message: "Server error in analyze callback" });
+        return res.status(500).json({
+          message: "Server error in analyze callback",
+          error: process.env.NODE_ENV === "production" ? undefined : String(innerErr?.message || innerErr),
+        });
       }
     });
   } catch (err) {
     console.error("❌ analyzePlant error:", err);
-    return res.status(500).json({ message: err.message || "Analyze failed" });
+    return res.status(500).json({
+      message: err.message || "Analyze failed",
+      error: process.env.NODE_ENV === "production" ? undefined : String(err?.message || err),
+    });
   }
 };
 
-// POST /api/analyze/:id/verify  (позначити як перевірене) — вже під auth
+// POST /api/analyze/:id/verify
 export const verifyAnalysis = async (req, res) => {
   try {
     const userId = req.user?.id;

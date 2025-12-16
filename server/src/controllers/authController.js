@@ -11,6 +11,19 @@ function signToken(user) {
   );
 }
 
+function authPayload(token, user) {
+  // ✅ сумісність з різними клієнтами:
+  // - token
+  // - accessToken
+  // - jwt
+  return {
+    token,
+    accessToken: token,
+    jwt: token,
+    user,
+  };
+}
+
 // POST /api/auth/register
 export async function register(req, res) {
   try {
@@ -24,11 +37,11 @@ export async function register(req, res) {
       return res.status(409).json({ message: "Користувач вже існує" });
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(String(password), 10);
     const user = await User.create(email, passwordHash);
     const token = signToken(user);
 
-    return res.status(201).json({ token, user });
+    return res.status(201).json(authPayload(token, user));
   } catch (e) {
     console.error("register error:", e);
     return res.status(500).json({ message: "Помилка реєстрації" });
@@ -50,14 +63,14 @@ export async function login(req, res) {
 
     const stored = userRow.password_hash || "";
 
-    // підтримка старих plaintext паролів (як у тебе було в users)
+    // підтримка старих plaintext паролів
     let ok = false;
     if (stored.startsWith("$2")) {
-      ok = await bcrypt.compare(password, stored);
+      ok = await bcrypt.compare(String(password), stored);
     } else {
-      ok = password === stored;
+      ok = String(password) === String(stored);
       if (ok) {
-        const newHash = await bcrypt.hash(password, 10);
+        const newHash = await bcrypt.hash(String(password), 10);
         await db.query("UPDATE public.users SET password_hash=$1 WHERE id=$2", [newHash, userRow.id]);
       }
     }
@@ -69,7 +82,7 @@ export async function login(req, res) {
     const user = { id: userRow.id, email: userRow.email };
     const token = signToken(user);
 
-    return res.json({ token, user });
+    return res.json(authPayload(token, user));
   } catch (e) {
     console.error("login error:", e);
     return res.status(500).json({ message: "Помилка входу" });

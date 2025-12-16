@@ -21,11 +21,12 @@ export default function Analyze() {
   const canSave = useMemo(() => Boolean(result?.analysisId), [result]);
 
   useEffect(() => {
-    // preview cleanup
     return () => {
       if (previewUrl) URL.revokeObjectURL(previewUrl);
+      stopCamera();
     };
-  }, [previewUrl]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function loadFolders() {
     try {
@@ -34,9 +35,9 @@ export default function Analyze() {
         return;
       }
       const r = await api.get("/folders");
-      setFolders(r.items || r.folders || []);
-    } catch (e) {
-      // якщо 401 — просто не показуємо папки
+      const items = r?.items || r?.folders || r || [];
+      setFolders(Array.isArray(items) ? items : []);
+    } catch {
       setFolders([]);
     }
   }
@@ -48,20 +49,41 @@ export default function Analyze() {
   async function startCamera() {
     setCameraError("");
     try {
+      if (!navigator?.mediaDevices?.getUserMedia) {
+        setCameraError("Браузер не підтримує доступ до камери (mediaDevices.getUserMedia).");
+        return;
+      }
+
+      // якщо вже є стрім — спочатку зупинимо
+      stopCamera();
+
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
+
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        // важливо: інколи без play() буде чорний екран
-        await videoRef.current.play();
+
+      // ✅ ВАЖЛИВО: videoRef має існувати. Тепер <video> рендериться завжди.
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+
+        await new Promise((resolve) => {
+          video.onloadedmetadata = () => resolve();
+        });
+
+        await video.play();
+        setCameraOn(true);
+      } else {
+        setCameraError("Video елемент не знайдено (videoRef null).");
+        setCameraOn(false);
       }
-      setCameraOn(true);
     } catch (e) {
+      console.error("startCamera error:", e);
       setCameraError(
-        "Не вдалося увімкнути камеру. Перевір дозвіл у браузері (камера) і чи вона не зайнята іншим додатком."
+        `Не вдалося увімкнути камеру: ${e?.name || ""} ${e?.message || ""}. ` +
+          "Перевір дозвіл у браузері (камера) і чи вона не зайнята іншим додатком."
       );
       setCameraOn(false);
     }
@@ -71,6 +93,7 @@ export default function Analyze() {
     try {
       const s = streamRef.current;
       if (s) s.getTracks().forEach((t) => t.stop());
+      if (videoRef.current) videoRef.current.srcObject = null;
     } finally {
       streamRef.current = null;
       setCameraOn(false);
@@ -90,13 +113,17 @@ export default function Analyze() {
   async function takePhoto() {
     setBanner("");
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !cameraOn) return;
+
+    const w = video.videoWidth || 1280;
+    const h = video.videoHeight || 720;
 
     const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth || 1280;
-    canvas.height = video.videoHeight || 720;
+    canvas.width = w;
+    canvas.height = h;
+
     const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, w, h);
 
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
     if (!blob) return;
@@ -104,6 +131,7 @@ export default function Analyze() {
     const f = new File([blob], `camera_${Date.now()}.jpg`, { type: "image/jpeg" });
     setFile(f);
     setResult(null);
+
     const url = URL.createObjectURL(f);
     setPreviewUrl(url);
   }
@@ -231,23 +259,32 @@ export default function Analyze() {
         <div style={{ padding: 14, borderRadius: 14, border: "1px solid rgba(255,255,255,0.12)" }}>
           <div style={{ marginBottom: 10, fontWeight: 700 }}>Попередній перегляд</div>
 
-          {cameraOn ? (
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted
-              style={{ width: "100%", borderRadius: 12, background: "#000", minHeight: 280 }}
-            />
-          ) : previewUrl ? (
-            <img
-              src={previewUrl}
-              alt="preview"
-              style={{ width: "100%", borderRadius: 12, objectFit: "contain", background: "#000" }}
-            />
-          ) : (
-            <div style={{ opacity: 0.7 }}>Немає зображення</div>
-          )}
+          {/* ✅ video рендериться ЗАВЖДИ, щоб videoRef існував */}
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            style={{
+              width: "100%",
+              borderRadius: 12,
+              background: "#000",
+              minHeight: 280,
+              display: cameraOn ? "block" : "none",
+            }}
+          />
+
+          {!cameraOn ? (
+            previewUrl ? (
+              <img
+                src={previewUrl}
+                alt="preview"
+                style={{ width: "100%", borderRadius: 12, objectFit: "contain", background: "#000" }}
+              />
+            ) : (
+              <div style={{ opacity: 0.7 }}>Немає зображення</div>
+            )
+          ) : null}
         </div>
 
         <div style={{ padding: 14, borderRadius: 14, border: "1px solid rgba(255,255,255,0.12)" }}>

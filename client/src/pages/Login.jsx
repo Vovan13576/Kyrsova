@@ -1,11 +1,10 @@
-import { useState } from "react";
-import { useLocation, useNavigate, Link } from "react-router-dom";
+import React, { useState } from "react";
+import { useNavigate, Link } from "react-router-dom";
 import api, { getErrorMessage } from "../services/api.js";
+import { setAuth } from "../services/auth.js";
 
 export default function Login() {
   const nav = useNavigate();
-  const loc = useLocation();
-
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -14,20 +13,30 @@ export default function Login() {
   async function onSubmit(e) {
     e.preventDefault();
     setErr("");
-    setBusy(true);
 
+    if (!email || !password) {
+      setErr("Введи email та пароль.");
+      return;
+    }
+
+    setBusy(true);
     try {
-      const { data } = await api.post("/auth/login", { email, password });
-      const token = data?.token || data?.accessToken || data?.jwt;
+      const res = await api.post("/auth/login", { email, password });
+
+      // ✅ підтримка різних форматів
+      const token = res?.token || res?.accessToken || res?.jwt || "";
+      const user = res?.user || null;
 
       if (!token) {
-        throw new Error("Сервер не повернув token/accessToken/jwt");
+        console.log("Login response was:", res);
+        setErr("Сервер не повернув token/accessToken/jwt");
+        return;
       }
 
-      localStorage.setItem("token", token);
+      setAuth(token, user);
 
-      const back = loc.state?.from || "/history";
-      nav(back);
+      // після логіну — на головну (або на /history якщо хочеш)
+      nav("/");
     } catch (e2) {
       setErr(getErrorMessage(e2));
     } finally {
@@ -36,35 +45,70 @@ export default function Login() {
   }
 
   return (
-    <div className="card" style={{ maxWidth: 520, margin: "0 auto" }}>
-      <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 10 }}>Вхід</div>
+    <div style={{ display: "grid", placeItems: "center", minHeight: "70vh", padding: 24 }}>
+      <div
+        style={{
+          width: "min(520px, 95vw)",
+          padding: 18,
+          borderRadius: 16,
+          border: "1px solid rgba(255,255,255,0.12)",
+          background: "rgba(0,0,0,0.18)",
+        }}
+      >
+        <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 14 }}>Вхід</div>
 
-      <form onSubmit={onSubmit} style={{ display: "grid", gap: 10 }}>
-        <input
-          className="input"
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-        />
+        <form onSubmit={onSubmit} style={{ display: "grid", gap: 10 }}>
+          <input
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="Email"
+            style={{
+              padding: "12px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.18)",
+              outline: "none",
+            }}
+          />
 
-        <input
-          className="input"
-          placeholder="Пароль"
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
+          <input
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Пароль"
+            type="password"
+            style={{
+              padding: "12px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.18)",
+              outline: "none",
+            }}
+          />
 
-        <button className="btn" disabled={busy}>
-          {busy ? "Вхід..." : "Увійти"}
-        </button>
+          <button
+            type="submit"
+            disabled={busy}
+            style={{
+              padding: "12px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: "rgba(255,255,255,0.06)",
+              cursor: busy ? "not-allowed" : "pointer",
+              fontWeight: 700,
+            }}
+          >
+            {busy ? "Вхід..." : "Увійти"}
+          </button>
+        </form>
 
-        {err ? <div style={{ color: "#ffb4b4", fontWeight: 900 }}>{err}</div> : null}
+        {err ? (
+          <div style={{ marginTop: 12, color: "#ffb3b3", fontWeight: 700 }}>
+            {err}
+          </div>
+        ) : null}
 
-        <div style={{ opacity: 0.85 }}>
+        <div style={{ marginTop: 10, opacity: 0.85 }}>
           Немає акаунту? <Link to="/register">Реєстрація</Link>
         </div>
-      </form>
+      </div>
     </div>
   );
 }

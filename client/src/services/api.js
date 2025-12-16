@@ -1,70 +1,75 @@
-import { getToken } from "./auth.js";
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
 
-const RAW_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
-
-function normalizeUrl(path) {
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return `${RAW_BASE}${p}`;
+function getStoredToken() {
+  return (
+    localStorage.getItem("token") ||
+    localStorage.getItem("accessToken") ||
+    localStorage.getItem("jwt") ||
+    ""
+  );
 }
 
-export function getErrorMessage(errOrResponse) {
-  if (!errOrResponse) return "Невідома помилка";
-  if (typeof errOrResponse === "string") return errOrResponse;
-
-  // якщо це fetch Response
-  if (errOrResponse instanceof Response) return `HTTP ${errOrResponse.status}`;
-
-  if (errOrResponse.message) return errOrResponse.message;
-  return "Помилка";
-}
-
-async function request(method, path, { data, isForm = false, headers = {} } = {}) {
-  const token = getToken();
-  const url = normalizeUrl(path);
-
-  const finalHeaders = { ...headers };
-  if (token) finalHeaders.Authorization = `Bearer ${token}`;
-
-  let body = undefined;
-
-  if (data !== undefined) {
-    if (isForm) {
-      body = data; // FormData
-    } else {
-      finalHeaders["Content-Type"] = "application/json";
-      body = JSON.stringify(data);
-    }
-  }
-
-  const res = await fetch(url, { method, headers: finalHeaders, body });
-
-  let payload = null;
+async function parseResponse(res) {
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) {
-    payload = await res.json().catch(() => null);
-  } else {
-    payload = await res.text().catch(() => null);
+    return await res.json().catch(() => null);
   }
+  return await res.text().catch(() => "");
+}
+
+async function request(method, path, { body, isForm } = {}) {
+  const url = path.startsWith("http") ? path : `${API_BASE}${path}`;
+
+  const headers = {};
+  const token = getStoredToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  if (!isForm) headers["Content-Type"] = "application/json";
+
+  // ✅ консоль-логи (як ти просив)
+  console.log(`API > ${method} ${url}`);
+
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: isForm ? body : body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await parseResponse(res);
+
+  console.log(`API < ${res.status} ${method} ${path}`, data || "");
 
   if (!res.ok) {
     const msg =
-      payload?.message || payload?.error || (typeof payload === "string" ? payload : null) || `HTTP ${res.status}`;
-    const e = new Error(msg);
-    e.status = res.status;
-    e.payload = payload;
-    throw e;
+      (data && typeof data === "object" && (data.message || data.error)) ||
+      res.statusText ||
+      "Request failed";
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    err.url = url;
+    throw err;
   }
 
-  return payload;
+  return data;
+}
+
+export function getErrorMessage(e) {
+  return (
+    e?.data?.message ||
+    e?.data?.error ||
+    e?.message ||
+    "Невідома помилка"
+  );
 }
 
 const api = {
   get: (path) => request("GET", path),
-  post: (path, data) => request("POST", path, { data }),
-  put: (path, data) => request("PUT", path, { data }),
+  post: (path, body) => request("POST", path, { body }),
+  put: (path, body) => request("PUT", path, { body }),
   del: (path) => request("DELETE", path),
-  postForm: (path, formData) => request("POST", path, { data: formData, isForm: true }),
+
+  postForm: (path, formData) => request("POST", path, { body: formData, isForm: true }),
 };
 
 export default api;
-export { api };
